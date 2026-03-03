@@ -9,3 +9,4 @@ __pycache__/
 tests/runs/
 
 *.pkl
+datasets/CICIDS2017/cicids2017_cleaned.csv

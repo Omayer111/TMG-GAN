@@ -88,6 +88,30 @@ python scripts/train_dnn.py \
   --resume
 ```
 
+### Increase GPU utilization on Kaggle
+
+For tabular DNN workloads, GPU utilization is often lower than CV/NLP models; use this command to push utilization higher:
+
+```bash
+python scripts/train_dnn.py \
+  --dataset CICIDS2017 \
+  --data-root /kaggle/input/my-nids-csv \
+  --output-dir /kaggle/working/outputs \
+  --cache-dir /kaggle/working/data_cache \
+  --epochs 2000 \
+  --batch-size 4096 \
+  --hidden-dim 1024 \
+  --num-workers 4 \
+  --prefetch-factor 4 \
+  --eval-interval 5 \
+  --checkpoint-interval 5 \
+  --compile \
+  --fast-mode \
+  --resume
+```
+
+If out-of-memory occurs, reduce `--batch-size` (4096 -> 2048 -> 1024).
+
 ## Colab (best for quick iteration)
 
 1. Mount Google Drive.

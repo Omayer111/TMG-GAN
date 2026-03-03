@@ -14,9 +14,15 @@ class ExperimentConfig:
     batch_size: int = 256
     learning_rate: float = 1e-3
     hidden_dim: int = 256
-    num_workers: int = 0
+    num_workers: int = 2
+    pin_memory: bool = True
+    persistent_workers: bool = True
+    prefetch_factor: int = 4
     checkpoint_interval: int = 5
     use_amp: bool = True
+    eval_interval: int = 1
+    compile_model: bool = False
+    fast_mode: bool = False
 
     @property
     def checkpoint_dir(self) -> Path:

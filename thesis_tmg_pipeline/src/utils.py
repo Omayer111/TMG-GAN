@@ -5,13 +5,15 @@ import torch
 from sklearn import metrics
 
 
-def set_random_state(seed: int) -> None:
+def set_random_state(seed: int, deterministic: bool = True) -> None:
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.benchmark = False
-    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = not deterministic
+    torch.backends.cudnn.deterministic = deterministic
+    if torch.cuda.is_available():
+        torch.backends.cuda.matmul.allow_tf32 = not deterministic
 
 
 def compute_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict:

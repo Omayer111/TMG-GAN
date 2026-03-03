@@ -28,8 +28,8 @@ def evaluate(model: nn.Module, dl: DataLoader, device: torch.device) -> tuple[fl
 
     with torch.no_grad():
         for x, y in dl:
-            x = x.to(device)
-            y = y.to(device)
+            x = x.to(device, non_blocking=True)
+            y = y.to(device, non_blocking=True)
             logits = model(x)
             loss = criterion(logits, y)
             loss_sum += loss.item() * len(y)
@@ -44,15 +44,30 @@ def evaluate(model: nn.Module, dl: DataLoader, device: torch.device) -> tuple[fl
 
 
 def train(config: ExperimentConfig, resume: bool) -> None:
-    set_random_state(config.seed)
+    set_random_state(config.seed, deterministic=not config.fast_mode)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if config.fast_mode and device.type == "cuda":
+        torch.set_float32_matmul_precision("high")
+
     data = load_dataset(config.dataset_name, config.data_root, config.cache_dir)
 
-    train_dl = DataLoader(data["train_dataset"], batch_size=config.batch_size, shuffle=True, num_workers=config.num_workers)
-    test_dl = DataLoader(data["test_dataset"], batch_size=config.batch_size, shuffle=False, num_workers=config.num_workers)
+    dl_kwargs = {
+        "batch_size": config.batch_size,
+        "num_workers": config.num_workers,
+        "pin_memory": config.pin_memory and device.type == "cuda",
+    }
+    if config.num_workers > 0:
+        dl_kwargs["persistent_workers"] = config.persistent_workers
+        dl_kwargs["prefetch_factor"] = config.prefetch_factor
+
+    train_dl = DataLoader(data["train_dataset"], shuffle=True, **dl_kwargs)
+    test_dl = DataLoader(data["test_dataset"], shuffle=False, **dl_kwargs)
 
     model = DNNClassifier(data["input_dim"], data["num_classes"], config.hidden_dim).to(device)
+    if config.compile_model and hasattr(torch, "compile"):
+        model = torch.compile(model)
+
     optimizer = Adam(model.parameters(), lr=config.learning_rate)
     criterion = nn.CrossEntropyLoss()
     scaler = torch.amp.GradScaler("cuda", enabled=config.use_amp and device.type == "cuda")
@@ -78,8 +93,8 @@ def train(config: ExperimentConfig, resume: bool) -> None:
     for epoch in range(start_epoch, config.epochs):
         model.train()
         for x, y in train_dl:
-            x = x.to(device)
-            y = y.to(device)
+            x = x.to(device, non_blocking=True)
+            y = y.to(device, non_blocking=True)
             optimizer.zero_grad(set_to_none=True)
             with torch.autocast(device_type=device.type, enabled=config.use_amp and device.type == "cuda"):
                 logits = model(x)
@@ -88,10 +103,20 @@ def train(config: ExperimentConfig, resume: bool) -> None:
             scaler.step(optimizer)
             scaler.update()
 
-        test_loss, test_metrics = evaluate(model, test_dl, device)
-        is_best = test_metrics["F1"] > best_f1
-        if is_best:
-            best_f1 = test_metrics["F1"]
+        should_evaluate = ((epoch + 1) % config.eval_interval == 0) or (epoch + 1 == config.epochs)
+        test_loss = float("nan")
+        test_metrics = {
+            "Precision": float("nan"),
+            "Recall": float("nan"),
+            "F1": float("nan"),
+            "Accuracy": float("nan"),
+        }
+        is_best = False
+        if should_evaluate:
+            test_loss, test_metrics = evaluate(model, test_dl, device)
+            is_best = test_metrics["F1"] > best_f1
+            if is_best:
+                best_f1 = test_metrics["F1"]
 
         should_save = ((epoch + 1) % config.checkpoint_interval == 0) or is_best or (epoch + 1 == config.epochs)
         if should_save:
@@ -121,13 +146,16 @@ def train(config: ExperimentConfig, resume: bool) -> None:
         with open(metrics_path, "w", encoding="utf-8") as f:
             json.dump(report, f, indent=2)
 
-        print(
-            f"Epoch {epoch + 1}/{config.epochs} | "
-            f"Loss {test_loss:.4f} | "
-            f"P {test_metrics['Precision']:.4f} | "
-            f"R {test_metrics['Recall']:.4f} | "
-            f"F1 {test_metrics['F1']:.4f}"
-        )
+        if should_evaluate:
+            print(
+                f"Epoch {epoch + 1}/{config.epochs} | "
+                f"Loss {test_loss:.4f} | "
+                f"P {test_metrics['Precision']:.4f} | "
+                f"R {test_metrics['Recall']:.4f} | "
+                f"F1 {test_metrics['F1']:.4f}"
+            )
+        else:
+            print(f"Epoch {epoch + 1}/{config.epochs} | train step complete (evaluation skipped)")
 
 
 def parse_args() -> argparse.Namespace:
@@ -143,6 +171,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hidden-dim", type=int, default=256)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--checkpoint-interval", type=int, default=5)
+    parser.add_argument("--eval-interval", type=int, default=1)
+    parser.add_argument("--num-workers", type=int, default=2)
+    parser.add_argument("--no-pin-memory", action="store_true")
+    parser.add_argument("--prefetch-factor", type=int, default=4)
+    parser.add_argument("--no-persistent-workers", action="store_true")
+    parser.add_argument("--compile", action="store_true")
+    parser.add_argument("--fast-mode", action="store_true")
     parser.add_argument("--no-amp", action="store_true")
     parser.add_argument("--resume", action="store_true")
     return parser.parse_args()
@@ -161,7 +196,14 @@ if __name__ == "__main__":
         batch_size=args.batch_size,
         learning_rate=args.lr,
         hidden_dim=args.hidden_dim,
+        num_workers=args.num_workers,
+        pin_memory=not args.no_pin_memory,
+        persistent_workers=not args.no_persistent_workers,
+        prefetch_factor=args.prefetch_factor,
         checkpoint_interval=args.checkpoint_interval,
+        eval_interval=args.eval_interval,
+        compile_model=args.compile,
+        fast_mode=args.fast_mode,
         use_amp=not args.no_amp,
     )
     train(cfg, resume=args.resume)
