@@ -5,6 +5,7 @@ This folder is fully separate from the original repository and is designed for t
 ## Current implemented slice
 
 - Resumable DNN baseline training for `CICIDS2017` and `UNSW-NB15`
+- Resumable ADASYN + DNN baseline training for `CICIDS2017` and `UNSW-NB15`
 - Automatic checkpointing (`latest.pt`, `best.pt`, `epoch_XXXX.pt`)
 - Resume support after interruption (`--resume`)
 - Deterministic seed setup and metric export (Precision, Recall, F1, Accuracy)
@@ -17,11 +18,13 @@ thesis_tmg_pipeline/
   scripts/
     context.py
     train_dnn.py
+    train_adasyn_dnn.py
   src/
     checkpointing.py
     utils.py
     config/settings.py
     data/tabular_loader.py
+    data/resampling.py
     models/dnn.py
   tests/
     test_resume_smoke.py
@@ -59,6 +62,8 @@ From `thesis_tmg_pipeline`:
 ```powershell
 pip install -r requirements.txt
 python scripts/train_dnn.py --dataset UNSW-NB15 --data-root C:/path/to/datasets --epochs 100 --resume
+
+python scripts/train_adasyn_dnn.py --dataset UNSW-NB15 --data-root C:/path/to/datasets --epochs 100 --resume
 ```
 
 ## Resume behavior
@@ -84,6 +89,22 @@ python scripts/train_dnn.py \
   --cache-dir /kaggle/working/data_cache \
   --epochs 2000 \
   --batch-size 256 \
+  --checkpoint-interval 5 \
+  --resume
+```
+
+ADASYN baseline command:
+
+```bash
+python scripts/train_adasyn_dnn.py \
+  --dataset CICIDS2017 \
+  --data-root /kaggle/input/my-nids-csv \
+  --output-dir /kaggle/working/outputs \
+  --cache-dir /kaggle/working/data_cache \
+  --run-name adasyn_dnn \
+  --epochs 2000 \
+  --batch-size 256 \
+  --adasyn-neighbors 5 \
   --checkpoint-interval 5 \
   --resume
 ```
@@ -139,5 +160,5 @@ python scripts/train_dnn.py \
 ## Next implementation steps
 
 - Add tabular TMG-GAN modules with identical checkpoint/resume logic
-- Add ADASYN baseline and unified benchmark runner
+- Add unified benchmark runner (DNN vs ADASYN-DNN vs GAN-family)
 - Add ablation toggles and multi-seed experiment orchestration
