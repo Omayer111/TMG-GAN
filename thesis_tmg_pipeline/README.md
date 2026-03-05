@@ -8,6 +8,7 @@ This folder is fully separate from the original repository and is designed for t
 - Resumable ADASYN + DNN baseline training for `CICIDS2017` and `UNSW-NB15`
 - Resumable tabular SNGAN baseline training for `CICIDS2017` and `UNSW-NB15`
 - Resumable tabular TACGAN-IDS baseline training for `CICIDS2017` and `UNSW-NB15`
+- Resumable tabular TMG-GAN baseline training for `CICIDS2017` and `UNSW-NB15`
 - Automatic checkpointing (`latest.pt`, `best.pt`, `epoch_XXXX.pt`)
 - Resume support after interruption (`--resume`)
 - Deterministic seed setup and metric export (Precision, Recall, F1, Accuracy)
@@ -23,6 +24,7 @@ thesis_tmg_pipeline/
     train_adasyn_dnn.py
     train_sngan_tabular.py
     train_tacgan_ids.py
+    train_tmg_gan.py
   src/
     checkpointing.py
     utils.py
@@ -34,6 +36,8 @@ thesis_tmg_pipeline/
     models/sngan_discriminator_tabular.py
     models/tacgan_generator_tabular.py
     models/tacgan_discriminator_tabular.py
+    models/tmg_generator_tabular.py
+    models/tmg_cd_model_tabular.py
   tests/
     test_resume_smoke.py
   outputs/
@@ -76,6 +80,8 @@ python scripts/train_adasyn_dnn.py --dataset UNSW-NB15 --data-root C:/path/to/da
 python scripts/train_sngan_tabular.py --dataset UNSW-NB15 --data-root C:/path/to/datasets --gan-epochs 20 --epochs 20 --resume
 
 python scripts/train_tacgan_ids.py --dataset UNSW-NB15 --data-root C:/path/to/datasets --gan-epochs 20 --epochs 20 --resume
+
+python scripts/train_tmg_gan.py --dataset UNSW-NB15 --data-root C:/path/to/datasets --gan-epochs 20 --epochs 20 --resume
 ```
 
 ## Resume behavior
@@ -168,6 +174,34 @@ python scripts/train_tacgan_ids.py \
   --resume
 ```
 
+Tabular TMG-GAN baseline command:
+
+```bash
+python scripts/train_tmg_gan.py \
+  --dataset CICIDS2017 \
+  --data-root /kaggle/input/my-nids-csv \
+  --output-dir /kaggle/working/outputs_tmg \
+  --cache-dir /kaggle/working/data_cache \
+  --run-name tmg_gan_tabular \
+  --gan-epochs 300 \
+  --gan-lr 0.0002 \
+  --z-dim 64 \
+  --gan-hidden-dim 256 \
+  --cd-steps 1 \
+  --g-steps 1 \
+  --gen-batch-size 2048 \
+  --hidden-warmup-epochs 100 \
+  --hidden-loss-weight 1.0 \
+  --diversity-loss-weight 0.1 \
+  --max-rejects 10 \
+  --epochs 200 \
+  --batch-size 1024 \
+  --lr 0.001 \
+  --eval-interval 5 \
+  --checkpoint-interval 5 \
+  --resume
+```
+
 ### Increase GPU utilization on Kaggle
 
 For tabular DNN workloads, GPU utilization is often lower than CV/NLP models; use this command to push utilization higher:
@@ -218,6 +252,6 @@ python scripts/train_dnn.py \
 
 ## Next implementation steps
 
-- Add tabular TMG-GAN modules with identical checkpoint/resume logic
 - Add unified benchmark runner (DNN vs ADASYN-DNN vs SNGAN vs TACGAN-IDS vs GAN-family)
 - Add ablation toggles and multi-seed experiment orchestration
+- Add MAGENTO wrapper and finalize paper-specific hyperparameter alignment
