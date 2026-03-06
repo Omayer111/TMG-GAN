@@ -2,7 +2,19 @@ import random
 
 import numpy as np
 import torch
+from torch import nn
 from sklearn import metrics
+
+
+def init_weights(layer: nn.Module) -> None:
+    """Weight initialization matching the TMG-GAN paper: N(0, 0.02) for Linear, N(1.0, 0.02) for BatchNorm."""
+    if isinstance(layer, nn.Linear):
+        nn.init.normal_(layer.weight, 0.0, 0.02)
+        if layer.bias is not None:
+            nn.init.constant_(layer.bias, 0)
+    elif isinstance(layer, nn.BatchNorm1d):
+        nn.init.normal_(layer.weight, 1.0, 0.02)
+        nn.init.constant_(layer.bias, 0)
 
 
 def set_random_state(seed: int, deterministic: bool = True) -> None:

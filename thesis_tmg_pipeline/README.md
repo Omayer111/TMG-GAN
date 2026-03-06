@@ -90,6 +90,103 @@ python scripts/train_tmg_gan.py --dataset UNSW-NB15 --data-root C:/path/to/datas
 - Re-run the same command with `--resume`.
 - Training continues from the latest checkpoint epoch, not from epoch 0.
 
+## Robust run protocol (recommended)
+
+Keep your existing model-specific commands unchanged, but execute them through a logging wrapper so every run has a persistent log file.
+
+### Naming convention
+
+- Use a stable `--run-name` for each experiment if you want resume continuity.
+- Keep `--output-dir` stable for that run.
+- Save logs under `<output-dir>/logs/<run-name>.log`.
+
+### Kaggle/Colab bash wrapper (recommended)
+
+```bash
+set -euo pipefail
+
+RUN_NAME=tmg_gan_tabular
+OUT_DIR=/kaggle/working/outputs_tmg
+LOG_DIR=$OUT_DIR/logs
+LOG_FILE=$LOG_DIR/${RUN_NAME}.log
+
+mkdir -p "$LOG_DIR"
+
+python -u scripts/train_tmg_gan.py \
+  --dataset CICIDS2017 \
+  --data-root /kaggle/input/my-nids-csv \
+  --output-dir "$OUT_DIR" \
+  --cache-dir /kaggle/working/data_cache \
+  --run-name "$RUN_NAME" \
+  --gan-epochs 300 \
+  --gan-lr 0.0002 \
+  --z-dim 64 \
+  --gan-hidden-dim 256 \
+  --cd-steps 1 \
+  --g-steps 1 \
+  --gen-batch-size 2048 \
+  --hidden-warmup-epochs 100 \
+  --hidden-loss-weight 1.0 \
+  --diversity-loss-weight 0.1 \
+  --max-rejects 10 \
+  --epochs 200 \
+  --batch-size 1024 \
+  --lr 0.001 \
+  --eval-interval 5 \
+  --checkpoint-interval 5 \
+  --resume 2>&1 | tee -a "$LOG_FILE"
+```
+
+### Windows PowerShell wrapper (local)
+
+```powershell
+$RunName = "tmg_gan_tabular"
+$OutDir = "C:/path/to/outputs_tmg"
+$LogDir = "$OutDir/logs"
+$LogFile = "$LogDir/$RunName.log"
+New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
+
+python -u scripts/train_tmg_gan.py `
+  --dataset CICIDS2017 `
+  --data-root C:/path/to/datasets `
+  --output-dir $OutDir `
+  --cache-dir C:/path/to/data_cache `
+  --run-name $RunName `
+  --gan-epochs 300 `
+  --gan-lr 0.0002 `
+  --z-dim 64 `
+  --gan-hidden-dim 256 `
+  --cd-steps 1 `
+  --g-steps 1 `
+  --gen-batch-size 2048 `
+  --hidden-warmup-epochs 100 `
+  --hidden-loss-weight 1.0 `
+  --diversity-loss-weight 0.1 `
+  --max-rejects 10 `
+  --epochs 200 `
+  --batch-size 1024 `
+  --lr 0.001 `
+  --eval-interval 5 `
+  --checkpoint-interval 5 `
+  --resume 2>&1 | Tee-Object -FilePath $LogFile -Append
+```
+
+### Monitor run status anytime
+
+```bash
+tail -n 80 /kaggle/working/outputs_tmg/logs/tmg_gan_tabular.log
+cat /kaggle/working/outputs_tmg/metrics/CICIDS2017/tmg_gan_tabular.json
+ls -lh /kaggle/working/outputs_tmg/checkpoints/CICIDS2017/tmg_gan_tabular
+```
+
+### Safe stop and resume checklist
+
+1. Near session end, optionally lower risk of lost progress with `--checkpoint-interval 1`.
+2. Stop run after a checkpoint boundary when possible.
+3. Save notebook version with output files in Kaggle.
+4. Re-run with same `--run-name`, `--output-dir`, and `--resume`.
+5. If divergence occurs, copy `best.pt` to `latest.pt` and resume.
+
 ## Kaggle (recommended for long free-tier runs)
 
 1. Upload prepared CSV dataset as a Kaggle Dataset.

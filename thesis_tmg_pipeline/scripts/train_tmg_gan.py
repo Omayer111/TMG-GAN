@@ -63,25 +63,42 @@ def generate_qualified_samples(
     num: int,
     device: torch.device,
     max_rejects: int,
+    batch_size: int = 1024,
 ) -> torch.Tensor:
+    """Batch-generate samples and filter by classifier prediction (Algorithm 2)."""
     accepted = []
-    rejects_left = max_rejects
+    total_accepted = 0
+    consecutive_empty = 0
 
     generator.eval()
     cd_model.eval()
 
     with torch.no_grad():
-        while len(accepted) < num:
-            candidate = generator.sample(1, device=device)
-            _, class_logits, _ = cd_model(candidate)
-            predicted = int(torch.argmax(class_logits, dim=1).item())
-            if predicted == class_id or rejects_left <= 0:
-                accepted.append(candidate.cpu())
-                rejects_left = max_rejects
-            else:
-                rejects_left -= 1
+        while total_accepted < num:
+            remaining = num - total_accepted
+            gen_count = min(batch_size, remaining * (max_rejects + 1))
+            candidates = generator.sample(gen_count, device=device)
+            _, class_logits, _ = cd_model(candidates)
+            predicted = torch.argmax(class_logits, dim=1)
+            mask = predicted == class_id
 
-    return torch.cat(accepted, dim=0)
+            if mask.any():
+                matched = candidates[mask].cpu()
+                take = min(len(matched), remaining)
+                accepted.append(matched[:take])
+                total_accepted += take
+                consecutive_empty = 0
+            else:
+                consecutive_empty += 1
+
+            # Fallback: if classifier never predicts this class, accept raw samples
+            if consecutive_empty >= max_rejects:
+                take = min(gen_count, num - total_accepted)
+                accepted.append(candidates[:take].cpu())
+                total_accepted += take
+                consecutive_empty = 0
+
+    return torch.cat(accepted, dim=0)[:num]
 
 
 def build_augmented_dataset(
@@ -103,19 +120,18 @@ def build_augmented_dataset(
     for class_id in range(num_classes):
         current = int(class_counts[class_id].item())
         need = target_count - current
-        while need > 0:
-            batch = min(need, gen_batch_size)
+        if need > 0:
             generated = generate_qualified_samples(
                 generator=generators[class_id],
                 cd_model=cd_model,
                 class_id=class_id,
-                num=batch,
+                num=need,
                 device=device,
                 max_rejects=max_rejects,
+                batch_size=gen_batch_size,
             )
             x_blocks.append(generated)
-            y_blocks.append(torch.full((batch,), class_id, dtype=torch.long))
-            need -= batch
+            y_blocks.append(torch.full((len(generated),), class_id, dtype=torch.long))
 
     x_aug = torch.cat(x_blocks, dim=0)
     y_aug = torch.cat(y_blocks, dim=0)
@@ -136,8 +152,9 @@ def train(
     gen_batch_size: int,
     hidden_warmup_epochs: int,
     hidden_loss_weight: float,
-    diversity_loss_weight: float,
     max_rejects: int,
+    gan_eval_interval: int,
+    max_grad_norm: float,
 ) -> None:
     set_random_state(config.seed, deterministic=not config.fast_mode)
 
@@ -219,6 +236,7 @@ def train(
     metrics_path = config.metrics_dir / f"{config.run_name}.json"
 
     if phase == "gan" and gan_start_epoch < gan_epochs:
+        nan_count = 0
         for gan_epoch in range(gan_start_epoch, gan_epochs):
             cd_model.train()
             for gen in generators:
@@ -233,6 +251,7 @@ def train(
             for class_id in class_order:
                 class_target = torch.full((config.batch_size,), class_id, dtype=torch.long, device=device)
 
+                # --- Train C+D (t_d steps per paper Algorithm 1 lines 2-7) ---
                 for _ in range(cd_steps):
                     cd_optimizer.zero_grad(set_to_none=True)
                     with torch.autocast(device_type=device.type, enabled=config.use_amp and device.type == "cuda"):
@@ -242,15 +261,24 @@ def train(
                         fake_batch = generators[class_id].sample(config.batch_size, device=device).detach()
                         score_fake, _, _ = cd_model(fake_batch)
 
+                        # Paper Eq: (D(fake) - D(real)) / 2 + CE(pred_real, target)
                         d_loss = 0.5 * (score_fake.mean() - score_real.mean())
                         c_loss = ce(pred_real, class_target)
                         cd_loss = d_loss + c_loss
 
-                    cd_scaler.scale(cd_loss).backward()
-                    cd_scaler.step(cd_optimizer)
-                    cd_scaler.update()
-                    cd_losses.append(float(cd_loss.item()))
+                    if torch.isfinite(cd_loss):
+                        cd_scaler.scale(cd_loss).backward()
+                        cd_scaler.unscale_(cd_optimizer)
+                        torch.nn.utils.clip_grad_norm_(cd_model.parameters(), max_grad_norm)
+                        cd_scaler.step(cd_optimizer)
+                        cd_scaler.update()
+                        cd_losses.append(float(cd_loss.item()))
+                        nan_count = 0
+                    else:
+                        cd_optimizer.zero_grad(set_to_none=True)
+                        nan_count += 1
 
+                # --- Train G (t_g steps per paper Algorithm 1 lines 8-13) ---
                 for _ in range(g_steps):
                     g_optimizers[class_id].zero_grad(set_to_none=True)
                     with torch.autocast(device_type=device.type, enabled=config.use_amp and device.type == "cuda"):
@@ -260,45 +288,72 @@ def train(
                         fake_batch = generators[class_id].sample(config.batch_size, device=device)
                         score_fake, pred_fake, hidden_fake = cd_model(fake_batch)
 
+                        # Paper: -D(fake) + CE(pred_fake, target) + O_k
                         label_loss = ce(pred_fake, class_target)
-                        hidden_loss = -cosine_similarity(hidden_real, hidden_fake, dim=1).mean()
+                        # Paper Eq. 4: cosine similarity between hidden features
                         if gan_epoch < hidden_warmup_epochs:
                             hidden_loss = torch.zeros(1, device=device, dtype=score_fake.dtype).squeeze(0)
+                        else:
+                            hidden_loss = -cosine_similarity(hidden_real.detach(), hidden_fake, dim=1).mean()
 
                         g_loss = -score_fake.mean() + label_loss + hidden_loss_weight * hidden_loss
 
-                    g_scalers[class_id].scale(g_loss).backward()
-                    g_scalers[class_id].step(g_optimizers[class_id])
-                    g_scalers[class_id].update()
-                    g_losses.append(float(g_loss.item()))
+                    if torch.isfinite(g_loss):
+                        g_scalers[class_id].scale(g_loss).backward()
+                        g_scalers[class_id].unscale_(g_optimizers[class_id])
+                        torch.nn.utils.clip_grad_norm_(generators[class_id].parameters(), max_grad_norm)
+                        g_scalers[class_id].step(g_optimizers[class_id])
+                        g_scalers[class_id].update()
+                        g_losses.append(float(g_loss.item()))
+                        nan_count = 0
+                    else:
+                        g_optimizers[class_id].zero_grad(set_to_none=True)
+                        nan_count += 1
 
-            if diversity_loss_weight > 0:
-                for opt in g_optimizers:
-                    opt.zero_grad(set_to_none=True)
-                hidden_vectors = []
-                for gen in generators:
-                    _ = gen.sample(8, device=device)
-                    hidden_vectors.append(gen.hidden_status.mean(dim=0))
+            # --- Inter-generator diversity loss (original code lines 79-98) ---
+            # Paper: penalize cosine similarity between different generators' hidden states
+            # Normalized by feature_dim as in original code
+            for opt in g_optimizers:
+                opt.zero_grad(set_to_none=True)
+            hidden_vectors = []
+            for gen in generators:
+                _ = gen.sample(3, device=device)
+                hidden_vectors.append(gen.hidden_status)
 
-                diversity_terms = []
-                for i in range(len(hidden_vectors)):
-                    for j in range(i + 1, len(hidden_vectors)):
+            diversity_terms = []
+            for i in range(len(hidden_vectors)):
+                for j in range(len(hidden_vectors)):
+                    if i != j:
                         diversity_terms.append(
-                            cosine_similarity(
-                                hidden_vectors[i].unsqueeze(0),
-                                hidden_vectors[j].unsqueeze(0),
-                                dim=1,
-                            ).mean()
+                            cosine_similarity(hidden_vectors[i], hidden_vectors[j], dim=1)
                         )
 
-                if diversity_terms:
-                    diversity_loss = diversity_loss_weight * torch.stack(diversity_terms).mean()
+            if diversity_terms:
+                diversity_loss = torch.cat(diversity_terms).mean() / feature_dim
+                if torch.isfinite(diversity_loss):
                     diversity_loss.backward()
-                    for optimizer in g_optimizers:
+                    for i_opt, optimizer in enumerate(g_optimizers):
+                        torch.nn.utils.clip_grad_norm_(generators[i_opt].parameters(), max_grad_norm)
                         optimizer.step()
+
+            if nan_count > 50:
+                print(f"ABORT: {nan_count} consecutive NaN losses detected at GAN epoch {gan_epoch + 1}.")
+                break
 
             last_cd_loss = float(np.mean(cd_losses)) if cd_losses else float("nan")
             last_g_loss = float(np.mean(g_losses)) if g_losses else float("nan")
+
+            # Periodic GAN-phase evaluation
+            gan_eval_metrics = {}
+            if gan_eval_interval > 0 and ((gan_epoch + 1) % gan_eval_interval == 0):
+                eval_loss, gan_eval_metrics = evaluate_cd_model(cd_model, test_dl, device)
+                cd_model.train()
+                for gen in generators:
+                    gen.train()
+                print(
+                    f"  GAN Eval @ epoch {gan_epoch + 1}: "
+                    f"Loss {eval_loss:.4f} | F1 {gan_eval_metrics.get('F1', 0):.4f}"
+                )
 
             manager.save(
                 payload={
@@ -328,7 +383,6 @@ def train(
                         "gen_batch_size": gen_batch_size,
                         "hidden_warmup_epochs": hidden_warmup_epochs,
                         "hidden_loss_weight": hidden_loss_weight,
-                        "diversity_loss_weight": diversity_loss_weight,
                         "max_rejects": max_rejects,
                     },
                 },
@@ -368,6 +422,8 @@ def train(
                 _, class_logits, _ = cd_model(x)
                 clf_loss = clf_criterion(class_logits, y)
             clf_scaler.scale(clf_loss).backward()
+            clf_scaler.unscale_(clf_optimizer)
+            torch.nn.utils.clip_grad_norm_(cd_model.parameters(), max_grad_norm)
             clf_scaler.step(clf_optimizer)
             clf_scaler.update()
 
@@ -419,7 +475,6 @@ def train(
                         "gen_batch_size": gen_batch_size,
                         "hidden_warmup_epochs": hidden_warmup_epochs,
                         "hidden_loss_weight": hidden_loss_weight,
-                        "diversity_loss_weight": diversity_loss_weight,
                         "max_rejects": max_rejects,
                     },
                 },
@@ -443,7 +498,6 @@ def train(
             "class_counts_after": class_counts_after,
             "hidden_warmup_epochs": hidden_warmup_epochs,
             "hidden_loss_weight": hidden_loss_weight,
-            "diversity_loss_weight": diversity_loss_weight,
         }
 
         with open(metrics_path, "w", encoding="utf-8") as f:
@@ -471,21 +525,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--run-name", type=str, default="tmg_gan_tabular")
 
     parser.add_argument("--epochs", type=int, default=100, help="Classifier fine-tuning epochs")
-    parser.add_argument("--batch-size", type=int, default=256)
+    parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--seed", type=int, default=42)
 
-    parser.add_argument("--gan-epochs", type=int, default=300)
+    parser.add_argument("--gan-epochs", type=int, default=2000)
     parser.add_argument("--gan-lr", type=float, default=2e-4)
-    parser.add_argument("--z-dim", type=int, default=64)
-    parser.add_argument("--gan-hidden-dim", type=int, default=256)
-    parser.add_argument("--cd-steps", type=int, default=1)
+    parser.add_argument("--z-dim", type=int, default=128)
+    parser.add_argument("--gan-hidden-dim", type=int, default=512)
+    parser.add_argument("--cd-steps", type=int, default=5)
     parser.add_argument("--g-steps", type=int, default=1)
     parser.add_argument("--gen-batch-size", type=int, default=1024)
-    parser.add_argument("--hidden-warmup-epochs", type=int, default=100)
+    parser.add_argument("--hidden-warmup-epochs", type=int, default=1000)
     parser.add_argument("--hidden-loss-weight", type=float, default=1.0)
-    parser.add_argument("--diversity-loss-weight", type=float, default=0.1)
     parser.add_argument("--max-rejects", type=int, default=10)
+    parser.add_argument("--gan-eval-interval", type=int, default=100, help="Evaluate CD model every N GAN epochs (0=disable)")
+    parser.add_argument("--max-grad-norm", type=float, default=1.0, help="Gradient clipping max norm")
 
     parser.add_argument("--checkpoint-interval", type=int, default=5)
     parser.add_argument("--eval-interval", type=int, default=1)
@@ -536,6 +591,7 @@ if __name__ == "__main__":
         gen_batch_size=args.gen_batch_size,
         hidden_warmup_epochs=args.hidden_warmup_epochs,
         hidden_loss_weight=args.hidden_loss_weight,
-        diversity_loss_weight=args.diversity_loss_weight,
         max_rejects=args.max_rejects,
+        gan_eval_interval=args.gan_eval_interval,
+        max_grad_norm=args.max_grad_norm,
     )
