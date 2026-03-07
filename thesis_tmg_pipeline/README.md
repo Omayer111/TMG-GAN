@@ -127,13 +127,15 @@ python -u scripts/train_tmg_gan.py \
   --gen-batch-size 2048 \
   --hidden-warmup-epochs 100 \
   --hidden-loss-weight 1.0 \
-  --diversity-loss-weight 0.1 \
+  --augmentation-cap 300000 \
   --max-rejects 10 \
   --epochs 200 \
   --batch-size 1024 \
   --lr 0.001 \
   --eval-interval 5 \
   --checkpoint-interval 5 \
+  --robust-rng-restore \
+  --reset-clf-optimizer-on-resume \
   --resume 2>&1 | tee -a "$LOG_FILE"
 ```
 
@@ -161,13 +163,15 @@ python -u scripts/train_tmg_gan.py `
   --gen-batch-size 2048 `
   --hidden-warmup-epochs 100 `
   --hidden-loss-weight 1.0 `
-  --diversity-loss-weight 0.1 `
+  --augmentation-cap 300000 `
   --max-rejects 10 `
   --epochs 200 `
   --batch-size 1024 `
   --lr 0.001 `
   --eval-interval 5 `
   --checkpoint-interval 5 `
+  --robust-rng-restore `
+  --reset-clf-optimizer-on-resume `
   --resume 2>&1 | Tee-Object -FilePath $LogFile -Append
 ```
 
@@ -289,13 +293,15 @@ python scripts/train_tmg_gan.py \
   --gen-batch-size 2048 \
   --hidden-warmup-epochs 100 \
   --hidden-loss-weight 1.0 \
-  --diversity-loss-weight 0.1 \
+  --augmentation-cap 300000 \
   --max-rejects 10 \
   --epochs 200 \
   --batch-size 1024 \
   --lr 0.001 \
   --eval-interval 5 \
   --checkpoint-interval 5 \
+  --robust-rng-restore \
+  --reset-clf-optimizer-on-resume \
   --resume
 ```
 

@@ -40,9 +40,38 @@ class CheckpointManager:
         return payload
 
     @staticmethod
-    def restore_rng_state(payload: dict) -> None:
-        random.setstate(payload["python"])
-        np.random.set_state(payload["numpy"])
-        torch.set_rng_state(payload["torch"])
-        if torch.cuda.is_available() and payload["torch_cuda"] is not None:
-            torch.cuda.set_rng_state_all(payload["torch_cuda"])
+    def _to_uint8_cpu_tensor(state) -> torch.Tensor:
+        if isinstance(state, torch.Tensor):
+            return state.to(device="cpu", dtype=torch.uint8).contiguous()
+        return torch.as_tensor(state, dtype=torch.uint8, device="cpu").contiguous()
+
+    @staticmethod
+    def restore_rng_state(payload: dict, robust: bool = False) -> None:
+        def _handle_restore_error(name: str, exc: Exception) -> None:
+            if robust:
+                print(f"WARNING: Failed to restore {name} RNG state ({exc}). Continuing with fresh RNG state.")
+                return
+            raise exc
+
+        try:
+            random.setstate(payload["python"])
+        except Exception as exc:
+            _handle_restore_error("python", exc)
+
+        try:
+            np.random.set_state(payload["numpy"])
+        except Exception as exc:
+            _handle_restore_error("numpy", exc)
+
+        try:
+            torch_state = CheckpointManager._to_uint8_cpu_tensor(payload["torch"])
+            torch.set_rng_state(torch_state)
+        except Exception as exc:
+            _handle_restore_error("torch", exc)
+
+        if torch.cuda.is_available() and payload.get("torch_cuda") is not None:
+            try:
+                cuda_states = [CheckpointManager._to_uint8_cpu_tensor(s) for s in payload["torch_cuda"]]
+                torch.cuda.set_rng_state_all(cuda_states)
+            except Exception as exc:
+                _handle_restore_error("torch_cuda", exc)

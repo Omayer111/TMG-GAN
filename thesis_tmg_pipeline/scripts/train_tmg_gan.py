@@ -1,5 +1,6 @@
 import argparse
 import json
+import math
 import random
 from pathlib import Path
 
@@ -16,10 +17,24 @@ from thesis_tmg_pipeline.src.models.tmg_cd_model_tabular import TMGGANCDModelTab
 from thesis_tmg_pipeline.src.models.tmg_generator_tabular import TMGGANGeneratorTabular
 
 
+def _sanitize_metric_value(value: float, sentinel: float = -1.0) -> float:
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return float(sentinel)
+    return numeric if math.isfinite(numeric) else float(sentinel)
+
+
+def _sanitize_metric_map(metrics: dict, sentinel: float = -1.0) -> dict:
+    return {k: _sanitize_metric_value(v, sentinel=sentinel) for k, v in metrics.items()}
+
+
 def evaluate_cd_model(model: TMGGANCDModelTabular, dl: DataLoader, device: torch.device) -> tuple[float, dict]:
     model.eval()
     criterion = nn.CrossEntropyLoss()
     loss_sum = 0.0
+    valid_samples = 0
+    skipped_batches = 0
     y_true = []
     y_pred = []
 
@@ -28,15 +43,34 @@ def evaluate_cd_model(model: TMGGANCDModelTabular, dl: DataLoader, device: torch
             x = x.to(device, non_blocking=True)
             y = y.to(device, non_blocking=True)
             _, class_logits, _ = model(x)
+            if not torch.isfinite(class_logits).all():
+                skipped_batches += 1
+                continue
             loss = criterion(class_logits, y)
+            if not torch.isfinite(loss):
+                skipped_batches += 1
+                continue
             loss_sum += loss.item() * len(y)
+            valid_samples += len(y)
             y_true.append(y.cpu().numpy())
             y_pred.append(torch.argmax(class_logits, dim=1).cpu().numpy())
+
+    if valid_samples == 0:
+        if skipped_batches > 0:
+            print(f"WARNING: evaluate_cd_model skipped all {skipped_batches} batches due to non-finite values.")
+        return float("nan"), {
+            "Precision": float("nan"),
+            "Recall": float("nan"),
+            "F1": float("nan"),
+            "Accuracy": float("nan"),
+        }
 
     y_true_np = np.concatenate(y_true)
     y_pred_np = np.concatenate(y_pred)
     metrics = compute_metrics(y_true_np, y_pred_np)
-    mean_loss = loss_sum / len(dl.dataset)
+    mean_loss = loss_sum / valid_samples
+    if skipped_batches > 0:
+        print(f"WARNING: evaluate_cd_model skipped {skipped_batches} non-finite batches.")
     return mean_loss, metrics
 
 
@@ -63,6 +97,7 @@ def generate_qualified_samples(
     num: int,
     device: torch.device,
     max_rejects: int,
+    strict_qualification_fallback: bool,
     batch_size: int = 1024,
 ) -> torch.Tensor:
     """Batch-generate samples and filter by classifier prediction (Algorithm 2)."""
@@ -93,6 +128,10 @@ def generate_qualified_samples(
 
             # Fallback: if classifier never predicts this class, accept raw samples
             if consecutive_empty >= max_rejects:
+                if strict_qualification_fallback:
+                    raise RuntimeError(
+                        f"Qualification failed for class {class_id}: no accepted samples after {max_rejects} retries."
+                    )
                 take = min(gen_count, num - total_accepted)
                 accepted.append(candidates[:take].cpu())
                 total_accepted += take
@@ -110,9 +149,14 @@ def build_augmented_dataset(
     gen_batch_size: int,
     device: torch.device,
     max_rejects: int,
+    augmentation_cap: int | None,
+    strict_qualification_fallback: bool,
 ) -> tuple[TensorDataset, list[int], list[int]]:
     class_counts = torch.bincount(y_train, minlength=num_classes)
     target_count = int(class_counts.max().item())
+    if augmentation_cap is not None:
+        target_count = min(target_count, int(augmentation_cap))
+        print(f"Applying augmentation cap: target_count={target_count} (cap={augmentation_cap}).")
 
     x_blocks = [x_train]
     y_blocks = [y_train]
@@ -128,6 +172,7 @@ def build_augmented_dataset(
                 num=need,
                 device=device,
                 max_rejects=max_rejects,
+                strict_qualification_fallback=strict_qualification_fallback,
                 batch_size=gen_batch_size,
             )
             x_blocks.append(generated)
@@ -155,6 +200,7 @@ def train(
     max_rejects: int,
     gan_eval_interval: int,
     max_grad_norm: float,
+    reset_clf_optimizer_on_resume: bool,
 ) -> None:
     set_random_state(config.seed, deterministic=not config.fast_mode)
 
@@ -209,6 +255,7 @@ def train(
     if resume:
         checkpoint = manager.load_latest(device)
         if checkpoint is not None:
+            resume_phase = checkpoint["phase"]
             cd_model.load_state_dict(checkpoint["cd_model_state_dict"])
             for i, state_dict in enumerate(checkpoint["generator_state_dicts"]):
                 generators[i].load_state_dict(state_dict)
@@ -218,9 +265,12 @@ def train(
             cd_scaler.load_state_dict(checkpoint["cd_scaler_state_dict"])
             for i, state_dict in enumerate(checkpoint["g_scaler_state_dicts"]):
                 g_scalers[i].load_state_dict(state_dict)
-            if "clf_optimizer_state_dict" in checkpoint:
+            should_reset_clf_state = reset_clf_optimizer_on_resume and resume_phase == "clf"
+            if should_reset_clf_state:
+                print("Resume mode: resetting classifier optimizer/scaler state for CLF phase.")
+            if ("clf_optimizer_state_dict" in checkpoint) and (not should_reset_clf_state):
                 clf_optimizer.load_state_dict(checkpoint["clf_optimizer_state_dict"])
-            if "clf_scaler_state_dict" in checkpoint:
+            if ("clf_scaler_state_dict" in checkpoint) and (not should_reset_clf_state):
                 clf_scaler.load_state_dict(checkpoint["clf_scaler_state_dict"])
 
             phase = checkpoint["phase"]
@@ -229,7 +279,11 @@ def train(
             best_f1 = float(checkpoint["best_f1"])
             last_cd_loss = float(checkpoint.get("last_cd_loss", float("nan")))
             last_g_loss = float(checkpoint.get("last_g_loss", float("nan")))
-            CheckpointManager.restore_rng_state(checkpoint["rng_state"])
+            rng_state = checkpoint.get("rng_state")
+            if rng_state is not None:
+                CheckpointManager.restore_rng_state(rng_state, robust=config.robust_rng_restore)
+            elif config.robust_rng_restore:
+                print("WARNING: rng_state missing from checkpoint. Continuing with fresh RNG state.")
             print(f"Resumed from phase={phase}, gan_epoch={gan_start_epoch}, clf_epoch={clf_start_epoch}")
 
     config.metrics_dir.mkdir(parents=True, exist_ok=True)
@@ -407,13 +461,17 @@ def train(
         gen_batch_size=gen_batch_size,
         device=device,
         max_rejects=max_rejects,
+        augmentation_cap=config.augmentation_cap,
+        strict_qualification_fallback=config.strict_qualification_fallback,
     )
     clf_train_dl = DataLoader(augmented_train_dataset, shuffle=True, **dl_kwargs)
 
     clf_criterion = nn.CrossEntropyLoss()
+    consecutive_fully_nonfinite_epochs = 0
 
     for clf_epoch in range(clf_start_epoch, config.epochs):
         cd_model.train()
+        nonfinite_train_steps = 0
         for x, y in clf_train_dl:
             x = x.to(device, non_blocking=True)
             y = y.to(device, non_blocking=True)
@@ -421,11 +479,34 @@ def train(
             with torch.autocast(device_type=device.type, enabled=config.use_amp and device.type == "cuda"):
                 _, class_logits, _ = cd_model(x)
                 clf_loss = clf_criterion(class_logits, y)
+
+            if (not torch.isfinite(class_logits).all()) or (not torch.isfinite(clf_loss)):
+                nonfinite_train_steps += 1
+                clf_optimizer.zero_grad(set_to_none=True)
+                continue
+
             clf_scaler.scale(clf_loss).backward()
             clf_scaler.unscale_(clf_optimizer)
             torch.nn.utils.clip_grad_norm_(cd_model.parameters(), max_grad_norm)
             clf_scaler.step(clf_optimizer)
             clf_scaler.update()
+
+        if nonfinite_train_steps > 0:
+            print(
+                f"WARNING: CLF epoch {clf_epoch + 1} skipped {nonfinite_train_steps} non-finite training steps."
+            )
+
+        if nonfinite_train_steps == len(clf_train_dl):
+            consecutive_fully_nonfinite_epochs += 1
+        else:
+            consecutive_fully_nonfinite_epochs = 0
+
+        if consecutive_fully_nonfinite_epochs >= 3:
+            print(
+                f"ABORT: {consecutive_fully_nonfinite_epochs} consecutive fully non-finite CLF epochs "
+                f"(stopped at epoch {clf_epoch + 1})."
+            )
+            break
 
         should_evaluate = ((clf_epoch + 1) % config.eval_interval == 0) or (clf_epoch + 1 == config.epochs)
         test_loss = float("nan")
@@ -439,9 +520,10 @@ def train(
         is_best = False
         if should_evaluate:
             test_loss, test_metrics = evaluate_cd_model(cd_model, test_dl, device)
-            is_best = test_metrics["F1"] > best_f1
+            f1_value = float(test_metrics["F1"])
+            is_best = math.isfinite(f1_value) and (f1_value > best_f1)
             if is_best:
-                best_f1 = test_metrics["F1"]
+                best_f1 = f1_value
 
         should_save = ((clf_epoch + 1) % config.checkpoint_interval == 0) or is_best or (clf_epoch + 1 == config.epochs)
         if should_save:
@@ -487,8 +569,8 @@ def train(
             "epoch": clf_epoch + 1,
             "dataset": config.dataset_name,
             "run_name": config.run_name,
-            "loss": test_loss,
-            **test_metrics,
+            "loss": _sanitize_metric_value(test_loss),
+            **_sanitize_metric_map(test_metrics),
             "best_f1": best_f1,
             "checkpoint_dir": str(config.checkpoint_dir),
             "gan_epochs": gan_epochs,
@@ -541,6 +623,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-rejects", type=int, default=10)
     parser.add_argument("--gan-eval-interval", type=int, default=100, help="Evaluate CD model every N GAN epochs (0=disable)")
     parser.add_argument("--max-grad-norm", type=float, default=1.0, help="Gradient clipping max norm")
+    parser.add_argument("--augmentation-cap", type=int, default=None, help="Cap per-class samples after augmentation")
+    parser.add_argument("--strict-qualification-fallback", action="store_true", help="Fail instead of force-accepting unqualified generated samples")
+    parser.add_argument("--robust-rng-restore", action="store_true", help="Skip RNG restore errors when resuming from older/incompatible checkpoints")
 
     parser.add_argument("--checkpoint-interval", type=int, default=5)
     parser.add_argument("--eval-interval", type=int, default=1)
@@ -552,6 +637,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fast-mode", action="store_true")
     parser.add_argument("--no-amp", action="store_true")
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--reset-clf-optimizer-on-resume", action="store_true", help="When resuming from CLF phase, ignore saved CLF optimizer/scaler state")
     return parser.parse_args()
 
 
@@ -577,6 +663,9 @@ if __name__ == "__main__":
         compile_model=args.compile,
         fast_mode=args.fast_mode,
         use_amp=not args.no_amp,
+        augmentation_cap=args.augmentation_cap,
+        strict_qualification_fallback=args.strict_qualification_fallback,
+        robust_rng_restore=args.robust_rng_restore,
     )
 
     train(
@@ -594,4 +683,5 @@ if __name__ == "__main__":
         max_rejects=args.max_rejects,
         gan_eval_interval=args.gan_eval_interval,
         max_grad_norm=args.max_grad_norm,
+        reset_clf_optimizer_on_resume=args.reset_clf_optimizer_on_resume,
     )

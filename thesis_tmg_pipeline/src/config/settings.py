@@ -23,6 +23,9 @@ class ExperimentConfig:
     eval_interval: int = 1
     compile_model: bool = False
     fast_mode: bool = False
+    augmentation_cap: int | None = None
+    strict_qualification_fallback: bool = False
+    robust_rng_restore: bool = False
 
     @property
     def checkpoint_dir(self) -> Path:
