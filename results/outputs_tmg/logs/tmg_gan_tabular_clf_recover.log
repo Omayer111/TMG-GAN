@@ -1,0 +1,36 @@
+Traceback (most recent call last):
+  File "/kaggle/working/thesis_tmg_pipeline/scripts/train_tmg_gan.py", line 582, in <module>
+    train(
+  File "/kaggle/working/thesis_tmg_pipeline/scripts/train_tmg_gan.py", line 232, in train
+    CheckpointManager.restore_rng_state(checkpoint["rng_state"])
+  File "/kaggle/working/thesis_tmg_pipeline/src/checkpointing.py", line 46, in restore_rng_state
+    torch.set_rng_state(payload["torch"])
+  File "/usr/local/lib/python3.12/dist-packages/torch/random.py", line 19, in set_rng_state
+    default_generator.set_state(new_state)
+TypeError: RNG state must be a torch.ByteTensor
+Resumed from phase=clf, gan_epoch=300, clf_epoch=130
+TMG CLF Epoch 131/170 | train step complete (evaluation skipped)
+TMG CLF Epoch 132/170 | train step complete (evaluation skipped)
+TMG CLF Epoch 133/170 | train step complete (evaluation skipped)
+TMG CLF Epoch 134/170 | train step complete (evaluation skipped)
+TMG CLF Epoch 135/170 | Loss 0.7470 | P 0.3327 | R 0.2332 | F1 0.2609
+TMG CLF Epoch 136/170 | train step complete (evaluation skipped)
+TMG CLF Epoch 137/170 | train step complete (evaluation skipped)
+TMG CLF Epoch 138/170 | train step complete (evaluation skipped)
+TMG CLF Epoch 139/170 | train step complete (evaluation skipped)
+TMG CLF Epoch 140/170 | Loss 0.8029 | P 0.3274 | R 0.2216 | F1 0.2505
+TMG CLF Epoch 141/170 | train step complete (evaluation skipped)
+TMG CLF Epoch 142/170 | train step complete (evaluation skipped)
+TMG CLF Epoch 143/170 | train step complete (evaluation skipped)
+TMG CLF Epoch 144/170 | train step complete (evaluation skipped)
+TMG CLF Epoch 145/170 | Loss 0.8390 | P 0.3298 | R 0.2161 | F1 0.2460
+TMG CLF Epoch 146/170 | train step complete (evaluation skipped)
+TMG CLF Epoch 147/170 | train step complete (evaluation skipped)
+TMG CLF Epoch 148/170 | train step complete (evaluation skipped)
+TMG CLF Epoch 149/170 | train step complete (evaluation skipped)
+TMG CLF Epoch 150/170 | Loss 0.8724 | P 0.3403 | R 0.2192 | F1 0.2523
+TMG CLF Epoch 151/170 | train step complete (evaluation skipped)
+TMG CLF Epoch 152/170 | train step complete (evaluation skipped)
+TMG CLF Epoch 153/170 | train step complete (evaluation skipped)
+TMG CLF Epoch 154/170 | train step complete (evaluation skipped)
+TMG CLF Epoch 155/170 | Loss 0.8671 | P 0.3336 | R 0.2144 | F1 0.2454

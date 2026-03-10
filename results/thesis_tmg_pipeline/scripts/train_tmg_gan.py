@@ -29,6 +29,37 @@ def _sanitize_metric_map(metrics: dict, sentinel: float = -1.0) -> dict:
     return {k: _sanitize_metric_value(v, sentinel=sentinel) for k, v in metrics.items()}
 
 
+def _resolve_augmentation_target_count(class_counts: torch.Tensor, mode: str) -> int:
+    counts = class_counts.to(dtype=torch.float32)
+    if mode == "second_max":
+        sorted_counts, _ = torch.sort(counts, descending=True)
+        if len(sorted_counts) > 1:
+            return int(sorted_counts[1].item())
+        return int(sorted_counts[0].item())
+    if mode == "median":
+        return int(torch.median(counts).item())
+    if mode == "p75":
+        return int(torch.quantile(counts, 0.75).item())
+    return int(counts.max().item())
+
+
+def _build_class_weights(class_counts_after: list[int], mode: str, effective_num_beta: float) -> torch.Tensor | None:
+    if mode == "none":
+        return None
+
+    counts = torch.tensor(class_counts_after, dtype=torch.float32)
+    counts = torch.clamp(counts, min=1.0)
+
+    if mode == "inverse_freq":
+        weights = counts.sum() / (len(counts) * counts)
+    else:
+        beta = min(max(float(effective_num_beta), 0.0), 0.999999)
+        effective_num = 1.0 - torch.pow(beta, counts)
+        weights = (1.0 - beta) / torch.clamp(effective_num, min=1e-12)
+
+    return weights / weights.mean()
+
+
 def evaluate_cd_model(model: TMGGANCDModelTabular, dl: DataLoader, device: torch.device) -> tuple[float, dict]:
     model.eval()
     criterion = nn.CrossEntropyLoss()
@@ -99,11 +130,16 @@ def generate_qualified_samples(
     max_rejects: int,
     strict_qualification_fallback: bool,
     batch_size: int = 1024,
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, dict[str, int]]:
     """Batch-generate samples and filter by classifier prediction (Algorithm 2)."""
     accepted = []
     total_accepted = 0
     consecutive_empty = 0
+    generated_candidates = 0
+    matched_candidates = 0
+    accepted_via_match = 0
+    accepted_via_fallback = 0
+    fallback_events = 0
 
     generator.eval()
     cd_model.eval()
@@ -113,15 +149,19 @@ def generate_qualified_samples(
             remaining = num - total_accepted
             gen_count = min(batch_size, remaining * (max_rejects + 1))
             candidates = generator.sample(gen_count, device=device)
+            generated_candidates += gen_count
             _, class_logits, _ = cd_model(candidates)
             predicted = torch.argmax(class_logits, dim=1)
             mask = predicted == class_id
+            matched_count = int(mask.sum().item())
+            matched_candidates += matched_count
 
             if mask.any():
                 matched = candidates[mask].cpu()
                 take = min(len(matched), remaining)
                 accepted.append(matched[:take])
                 total_accepted += take
+                accepted_via_match += take
                 consecutive_empty = 0
             else:
                 consecutive_empty += 1
@@ -135,9 +175,20 @@ def generate_qualified_samples(
                 take = min(gen_count, num - total_accepted)
                 accepted.append(candidates[:take].cpu())
                 total_accepted += take
+                accepted_via_fallback += take
+                fallback_events += 1
                 consecutive_empty = 0
 
-    return torch.cat(accepted, dim=0)[:num]
+    stats = {
+        "requested": int(num),
+        "generated_candidates": int(generated_candidates),
+        "matched_candidates": int(matched_candidates),
+        "accepted_via_match": int(accepted_via_match),
+        "accepted_via_fallback": int(accepted_via_fallback),
+        "fallback_events": int(fallback_events),
+    }
+
+    return torch.cat(accepted, dim=0)[:num], stats
 
 
 def build_augmented_dataset(
@@ -150,22 +201,35 @@ def build_augmented_dataset(
     device: torch.device,
     max_rejects: int,
     augmentation_cap: int | None,
+    augmentation_target_mode: str,
+    max_synthetic_multiplier: float | None,
     strict_qualification_fallback: bool,
-) -> tuple[TensorDataset, list[int], list[int]]:
+) -> tuple[TensorDataset, list[int], list[int], dict[str, dict[str, int | float]]]:
     class_counts = torch.bincount(y_train, minlength=num_classes)
-    target_count = int(class_counts.max().item())
+    target_count = _resolve_augmentation_target_count(class_counts, augmentation_target_mode)
     if augmentation_cap is not None:
         target_count = min(target_count, int(augmentation_cap))
         print(f"Applying augmentation cap: target_count={target_count} (cap={augmentation_cap}).")
+    print(f"Augmentation target mode='{augmentation_target_mode}' resolved target_count={target_count}.")
 
     x_blocks = [x_train]
     y_blocks = [y_train]
+    qualification_stats: dict[str, dict[str, int | float]] = {}
 
     for class_id in range(num_classes):
         current = int(class_counts[class_id].item())
         need = target_count - current
+        if need > 0 and (max_synthetic_multiplier is not None):
+            bounded_need = int(round(current * max_synthetic_multiplier))
+            bounded_need = max(0, bounded_need)
+            if bounded_need < need:
+                print(
+                    f"Class {class_id}: limiting synthetic samples from {need} to {bounded_need} "
+                    f"(max_synthetic_multiplier={max_synthetic_multiplier})."
+                )
+            need = min(need, bounded_need)
         if need > 0:
-            generated = generate_qualified_samples(
+            generated, class_stats = generate_qualified_samples(
                 generator=generators[class_id],
                 cd_model=cd_model,
                 class_id=class_id,
@@ -177,12 +241,32 @@ def build_augmented_dataset(
             )
             x_blocks.append(generated)
             y_blocks.append(torch.full((len(generated),), class_id, dtype=torch.long))
+        else:
+            class_stats = {
+                "requested": 0,
+                "generated_candidates": 0,
+                "matched_candidates": 0,
+                "accepted_via_match": 0,
+                "accepted_via_fallback": 0,
+                "fallback_events": 0,
+            }
+
+        requested = int(class_stats["requested"])
+        fallback_rate = (float(class_stats["accepted_via_fallback"]) / requested) if requested > 0 else 0.0
+        class_stats["fallback_rate"] = fallback_rate
+        qualification_stats[str(class_id)] = class_stats
+        print(
+            f"Qualification class {class_id}: requested={requested}, "
+            f"accepted_match={class_stats['accepted_via_match']}, "
+            f"accepted_fallback={class_stats['accepted_via_fallback']}, "
+            f"fallback_rate={fallback_rate:.4f}, events={class_stats['fallback_events']}"
+        )
 
     x_aug = torch.cat(x_blocks, dim=0)
     y_aug = torch.cat(y_blocks, dim=0)
     class_counts_after = torch.bincount(y_aug, minlength=num_classes).cpu().numpy().astype(int).tolist()
 
-    return TensorDataset(x_aug, y_aug), class_counts.cpu().numpy().astype(int).tolist(), class_counts_after
+    return TensorDataset(x_aug, y_aug), class_counts.cpu().numpy().astype(int).tolist(), class_counts_after, qualification_stats
 
 
 def train(
@@ -201,6 +285,16 @@ def train(
     gan_eval_interval: int,
     max_grad_norm: float,
     reset_clf_optimizer_on_resume: bool,
+    augmentation_target_mode: str,
+    max_synthetic_multiplier: float | None,
+    clf_class_weighting: str,
+    clf_effective_num_beta: float,
+    clf_label_smoothing: float,
+    clf_lr_patience: int,
+    clf_lr_decay: float,
+    clf_min_lr: float,
+    clf_early_stop_patience: int,
+    max_fallback_rate: float,
 ) -> None:
     set_random_state(config.seed, deterministic=not config.fast_mode)
 
@@ -452,7 +546,7 @@ def train(
         phase = "clf"
         clf_start_epoch = 0
 
-    augmented_train_dataset, class_counts_before, class_counts_after = build_augmented_dataset(
+    augmented_train_dataset, class_counts_before, class_counts_after, qualification_stats = build_augmented_dataset(
         generators=generators,
         cd_model=cd_model,
         x_train=data["x_train"],
@@ -462,12 +556,42 @@ def train(
         device=device,
         max_rejects=max_rejects,
         augmentation_cap=config.augmentation_cap,
+        augmentation_target_mode=augmentation_target_mode,
+        max_synthetic_multiplier=max_synthetic_multiplier,
         strict_qualification_fallback=config.strict_qualification_fallback,
     )
     clf_train_dl = DataLoader(augmented_train_dataset, shuffle=True, **dl_kwargs)
 
-    clf_criterion = nn.CrossEntropyLoss()
+    requested_total = sum(int(stats["requested"]) for stats in qualification_stats.values())
+    fallback_total = sum(int(stats["accepted_via_fallback"]) for stats in qualification_stats.values())
+    fallback_rate_total = (float(fallback_total) / requested_total) if requested_total > 0 else 0.0
+    print(
+        f"Qualification summary: requested={requested_total}, accepted_fallback={fallback_total}, "
+        f"fallback_rate={fallback_rate_total:.4f}"
+    )
+    if fallback_rate_total > max_fallback_rate:
+        raise RuntimeError(
+            f"Fallback rate {fallback_rate_total:.4f} exceeded threshold {max_fallback_rate:.4f}. "
+            "Generated sample quality is too low for this run configuration."
+        )
+
+    class_weights = _build_class_weights(class_counts_after, clf_class_weighting, clf_effective_num_beta)
+    if class_weights is not None:
+        class_weights = class_weights.to(device=device)
+        print(f"Using class-weighted CLF loss mode='{clf_class_weighting}' weights={class_weights.detach().cpu().tolist()}")
+    else:
+        print("Using unweighted CLF loss.")
+
+    clf_criterion = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=clf_label_smoothing)
+    clf_lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        clf_optimizer,
+        mode="max",
+        factor=clf_lr_decay,
+        patience=clf_lr_patience,
+        min_lr=clf_min_lr,
+    )
     consecutive_fully_nonfinite_epochs = 0
+    epochs_without_improve = 0
 
     for clf_epoch in range(clf_start_epoch, config.epochs):
         cd_model.train()
@@ -522,8 +646,13 @@ def train(
             test_loss, test_metrics = evaluate_cd_model(cd_model, test_dl, device)
             f1_value = float(test_metrics["F1"])
             is_best = math.isfinite(f1_value) and (f1_value > best_f1)
+            scheduler_signal = f1_value if math.isfinite(f1_value) else -1.0
+            clf_lr_scheduler.step(scheduler_signal)
             if is_best:
                 best_f1 = f1_value
+                epochs_without_improve = 0
+            else:
+                epochs_without_improve += 1
 
         should_save = ((clf_epoch + 1) % config.checkpoint_interval == 0) or is_best or (clf_epoch + 1 == config.epochs)
         if should_save:
@@ -559,6 +688,7 @@ def train(
                         "hidden_loss_weight": hidden_loss_weight,
                         "max_rejects": max_rejects,
                     },
+                    "qualification_stats": qualification_stats,
                 },
                 epoch=clf_epoch + 1,
                 is_best=is_best,
@@ -580,6 +710,15 @@ def train(
             "class_counts_after": class_counts_after,
             "hidden_warmup_epochs": hidden_warmup_epochs,
             "hidden_loss_weight": hidden_loss_weight,
+            "augmentation_target_mode": augmentation_target_mode,
+            "max_synthetic_multiplier": max_synthetic_multiplier,
+            "clf_class_weighting": clf_class_weighting,
+            "clf_effective_num_beta": clf_effective_num_beta,
+            "clf_label_smoothing": clf_label_smoothing,
+            "clf_learning_rate": float(clf_optimizer.param_groups[0]["lr"]),
+            "epochs_without_improve": epochs_without_improve,
+            "qualification_stats": qualification_stats,
+            "fallback_rate_total": fallback_rate_total,
         }
 
         with open(metrics_path, "w", encoding="utf-8") as f:
@@ -591,10 +730,18 @@ def train(
                 f"Loss {test_loss:.4f} | "
                 f"P {test_metrics['Precision']:.4f} | "
                 f"R {test_metrics['Recall']:.4f} | "
-                f"F1 {test_metrics['F1']:.4f}"
+                f"F1 {test_metrics['F1']:.4f} | "
+                f"LR {clf_optimizer.param_groups[0]['lr']:.6f}"
             )
         else:
             print(f"TMG CLF Epoch {clf_epoch + 1}/{config.epochs} | train step complete (evaluation skipped)")
+
+        if should_evaluate and (clf_early_stop_patience > 0) and (epochs_without_improve >= clf_early_stop_patience):
+            print(
+                f"EARLY STOP: no F1 improvement for {epochs_without_improve} evaluated epochs "
+                f"(patience={clf_early_stop_patience})."
+            )
+            break
 
 
 def parse_args() -> argparse.Namespace:
@@ -624,8 +771,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gan-eval-interval", type=int, default=100, help="Evaluate CD model every N GAN epochs (0=disable)")
     parser.add_argument("--max-grad-norm", type=float, default=1.0, help="Gradient clipping max norm")
     parser.add_argument("--augmentation-cap", type=int, default=None, help="Cap per-class samples after augmentation")
+    parser.add_argument("--augmentation-target-mode", type=str, default="max", choices=["max", "second_max", "median", "p75"], help="Rule for selecting target class size before synthetic generation")
+    parser.add_argument("--max-synthetic-multiplier", type=float, default=None, help="Max synthetic samples as a multiple of each class's original count")
     parser.add_argument("--strict-qualification-fallback", action="store_true", help="Fail instead of force-accepting unqualified generated samples")
     parser.add_argument("--robust-rng-restore", action="store_true", help="Skip RNG restore errors when resuming from older/incompatible checkpoints")
+    parser.add_argument("--clf-class-weighting", type=str, default="none", choices=["none", "inverse_freq", "effective_num"], help="Class weighting strategy for CLF fine-tuning")
+    parser.add_argument("--clf-effective-num-beta", type=float, default=0.9999, help="Beta parameter for effective-number class weighting")
+    parser.add_argument("--clf-label-smoothing", type=float, default=0.0, help="Label smoothing for CLF cross-entropy")
+    parser.add_argument("--clf-lr-patience", type=int, default=3, help="ReduceLROnPlateau patience in evaluated epochs")
+    parser.add_argument("--clf-lr-decay", type=float, default=0.5, help="ReduceLROnPlateau factor")
+    parser.add_argument("--clf-min-lr", type=float, default=1e-5, help="Minimum classifier LR for scheduler")
+    parser.add_argument("--clf-early-stop-patience", type=int, default=0, help="Stop CLF phase after N evaluated epochs without F1 improvement (0=disable)")
+    parser.add_argument("--max-fallback-rate", type=float, default=1.0, help="Abort run when accepted_via_fallback/requested exceeds this threshold")
 
     parser.add_argument("--checkpoint-interval", type=int, default=5)
     parser.add_argument("--eval-interval", type=int, default=1)
@@ -664,8 +821,18 @@ if __name__ == "__main__":
         fast_mode=args.fast_mode,
         use_amp=not args.no_amp,
         augmentation_cap=args.augmentation_cap,
+        augmentation_target_mode=args.augmentation_target_mode,
+        max_synthetic_multiplier=args.max_synthetic_multiplier,
         strict_qualification_fallback=args.strict_qualification_fallback,
         robust_rng_restore=args.robust_rng_restore,
+        clf_class_weighting=args.clf_class_weighting,
+        clf_effective_num_beta=args.clf_effective_num_beta,
+        clf_label_smoothing=args.clf_label_smoothing,
+        clf_lr_patience=args.clf_lr_patience,
+        clf_lr_decay=args.clf_lr_decay,
+        clf_min_lr=args.clf_min_lr,
+        clf_early_stop_patience=args.clf_early_stop_patience,
+        max_fallback_rate=args.max_fallback_rate,
     )
 
     train(
@@ -684,4 +851,13 @@ if __name__ == "__main__":
         gan_eval_interval=args.gan_eval_interval,
         max_grad_norm=args.max_grad_norm,
         reset_clf_optimizer_on_resume=args.reset_clf_optimizer_on_resume,
+        augmentation_target_mode=args.augmentation_target_mode,
+        max_synthetic_multiplier=args.max_synthetic_multiplier,
+        clf_class_weighting=args.clf_class_weighting,
+        clf_effective_num_beta=args.clf_effective_num_beta,
+        clf_label_smoothing=args.clf_label_smoothing,
+        clf_lr_patience=args.clf_lr_patience,
+        clf_lr_decay=args.clf_lr_decay,
+        clf_min_lr=args.clf_min_lr,
+        clf_early_stop_patience=args.clf_early_stop_patience,
     )

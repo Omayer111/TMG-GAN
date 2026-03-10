@@ -1,0 +1,34 @@
+{
+  "phase": "clf",
+  "epoch": 63,
+  "dataset": "CICIDS2017",
+  "run_name": "sngan_tabular",
+  "loss": NaN,
+  "Precision": NaN,
+  "Recall": NaN,
+  "F1": NaN,
+  "Accuracy": NaN,
+  "best_f1": 0.7843812452782498,
+  "checkpoint_dir": "/kaggle/working/outputs_sngan/checkpoints/CICIDS2017/sngan_tabular",
+  "gan_epochs": 300,
+  "gan_last_d_loss": 1.9999529068845177,
+  "gan_last_g_loss": -0.04089896110108661,
+  "class_counts_before": [
+    1559,
+    7320,
+    102411,
+    154996,
+    1675917,
+    72555,
+    1714
+  ],
+  "class_counts_after": [
+    1675917,
+    1675917,
+    1675917,
+    1675917,
+    1675917,
+    1675917,
+    1675917
+  ]
+}

@@ -13,3 +13,9 @@ datasets/CICIDS2017/cicids2017_cleaned.csv
 thesis_tmg_pipeline.zip
 thesis_tmg_pipeline.zip
 thesis_tmg_pipeline.zip
+*.pt
+*.pth
+results/datasets/CICIDS2017/x_test.csv
+results/datasets/CICIDS2017/x_train.csv
+results/datasets/CICIDS2017/y_test.csv
+results/datasets/CICIDS2017/y_train.csv

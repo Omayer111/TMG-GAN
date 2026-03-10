@@ -1,0 +1,16 @@
+Traceback (most recent call last):
+  File "/kaggle/working/thesis_tmg_pipeline/scripts/train_adasyn_dnn.py", line 242, in <module>
+    train(
+  File "/kaggle/working/thesis_tmg_pipeline/scripts/train_adasyn_dnn.py", line 59, in train
+    data = load_dataset(config.dataset_name, config.data_root, config.cache_dir)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/kaggle/working/thesis_tmg_pipeline/src/data/tabular_loader.py", line 19, in load_dataset
+    return torch.load(cache_file, weights_only=False)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/torch/serialization.py", line 1491, in load
+    with _open_zipfile_reader(opened_file) as opened_zipfile:
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/torch/serialization.py", line 771, in __init__
+    super().__init__(torch._C.PyTorchFileReader(name_or_buffer))
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+RuntimeError: PytorchStreamReader failed reading zip archive: failed finding central directory

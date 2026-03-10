@@ -1,0 +1,36 @@
+{
+  "phase": "clf",
+  "epoch": 155,
+  "dataset": "CICIDS2017",
+  "run_name": "tmg_gan_tabular",
+  "loss": 0.867144817788268,
+  "Precision": 0.33363768735024946,
+  "Recall": 0.21441515475191256,
+  "F1": 0.24542422702878097,
+  "Accuracy": 0.8187507686692401,
+  "best_f1": 0.2779871797602592,
+  "checkpoint_dir": "/kaggle/working/outputs_tmg/checkpoints/CICIDS2017/tmg_gan_tabular",
+  "gan_epochs": 300,
+  "gan_last_cd_loss": 1.7998783929007394,
+  "gan_last_g_loss": 0.08109119960239955,
+  "class_counts_before": [
+    1559,
+    7320,
+    102411,
+    154996,
+    1675917,
+    72555,
+    1714
+  ],
+  "class_counts_after": [
+    1675917,
+    1675917,
+    1675917,
+    1675917,
+    1675917,
+    1675917,
+    1675917
+  ],
+  "hidden_warmup_epochs": 100,
+  "hidden_loss_weight": 1.0
+}

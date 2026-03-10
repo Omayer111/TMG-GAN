@@ -1,0 +1,19 @@
+{
+  "dataset_name": "CICIDS2017",
+  "label_col": "Attack Type",
+  "test_size": 0.2,
+  "seed": 42,
+  "nan_policy": "drop",
+  "n_train": 2016472,
+  "n_test": 504118,
+  "n_features": 52,
+  "classes": {
+    "Bots": 0,
+    "Brute Force": 1,
+    "DDoS": 2,
+    "DoS": 3,
+    "Normal Traffic": 4,
+    "Port Scanning": 5,
+    "Web Attacks": 6
+  }
+}

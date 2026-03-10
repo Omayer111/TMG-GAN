@@ -1,0 +1,32 @@
+{
+  "epoch": 327,
+  "dataset": "CICIDS2017",
+  "run_name": "adasyn_dnn",
+  "loss": NaN,
+  "Precision": 0.00011023496199585925,
+  "Recall": 0.14285714285714285,
+  "F1": 0.0002202999307102917,
+  "Accuracy": 0.0007716447339710148,
+  "best_f1": 0.8398685306677457,
+  "checkpoint_dir": "/kaggle/working/outputs_adasyn/checkpoints/CICIDS2017/adasyn_dnn",
+  "sampling_method": "ADASYN",
+  "effective_neighbors": 3,
+  "class_counts_before": [
+    1559,
+    7320,
+    102411,
+    154996,
+    1675917,
+    72555,
+    1714
+  ],
+  "class_counts_after": [
+    1675847,
+    1675930,
+    1675897,
+    1676149,
+    1675917,
+    1675554,
+    1675914
+  ]
+}
