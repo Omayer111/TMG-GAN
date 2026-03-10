@@ -19,3 +19,4 @@ results/datasets/CICIDS2017/x_test.csv
 results/datasets/CICIDS2017/x_train.csv
 results/datasets/CICIDS2017/y_test.csv
 results/datasets/CICIDS2017/y_train.csv
+results/state.db
