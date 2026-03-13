@@ -771,8 +771,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gan-eval-interval", type=int, default=100, help="Evaluate CD model every N GAN epochs (0=disable)")
     parser.add_argument("--max-grad-norm", type=float, default=1.0, help="Gradient clipping max norm")
     parser.add_argument("--augmentation-cap", type=int, default=None, help="Cap per-class samples after augmentation")
-    parser.add_argument("--augmentation-target-mode", type=str, default="max", choices=["max", "second_max", "median", "p75"], help="Rule for selecting target class size before synthetic generation")
-    parser.add_argument("--max-synthetic-multiplier", type=float, default=None, help="Max synthetic samples as a multiple of each class's original count")
+    parser.add_argument("--augmentation-target-mode", type=str, default="second_max", choices=["max", "second_max", "median", "p75"], help="Rule for selecting target class size before synthetic generation")
+    parser.add_argument("--max-synthetic-multiplier", type=float, default=1.5, help="Max synthetic samples as a multiple of each class's original count")
     parser.add_argument("--strict-qualification-fallback", action="store_true", help="Fail instead of force-accepting unqualified generated samples")
     parser.add_argument("--robust-rng-restore", action="store_true", help="Skip RNG restore errors when resuming from older/incompatible checkpoints")
     parser.add_argument("--clf-class-weighting", type=str, default="none", choices=["none", "inverse_freq", "effective_num"], help="Class weighting strategy for CLF fine-tuning")
@@ -782,7 +782,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--clf-lr-decay", type=float, default=0.5, help="ReduceLROnPlateau factor")
     parser.add_argument("--clf-min-lr", type=float, default=1e-5, help="Minimum classifier LR for scheduler")
     parser.add_argument("--clf-early-stop-patience", type=int, default=0, help="Stop CLF phase after N evaluated epochs without F1 improvement (0=disable)")
-    parser.add_argument("--max-fallback-rate", type=float, default=1.0, help="Abort run when accepted_via_fallback/requested exceeds this threshold")
+    parser.add_argument("--max-fallback-rate", type=float, default=0.05, help="Abort run when accepted_via_fallback/requested exceeds this threshold")
 
     parser.add_argument("--checkpoint-interval", type=int, default=5)
     parser.add_argument("--eval-interval", type=int, default=1)
@@ -860,4 +860,5 @@ if __name__ == "__main__":
         clf_lr_decay=args.clf_lr_decay,
         clf_min_lr=args.clf_min_lr,
         clf_early_stop_patience=args.clf_early_stop_patience,
+        max_fallback_rate=args.max_fallback_rate,
     )

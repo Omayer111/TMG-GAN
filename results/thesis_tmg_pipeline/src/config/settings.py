@@ -24,8 +24,8 @@ class ExperimentConfig:
     compile_model: bool = False
     fast_mode: bool = False
     augmentation_cap: int | None = None
-    augmentation_target_mode: str = "max"
-    max_synthetic_multiplier: float | None = None
+    augmentation_target_mode: str = "second_max"
+    max_synthetic_multiplier: float | None = 1.5
     strict_qualification_fallback: bool = False
     robust_rng_restore: bool = False
     clf_class_weighting: str = "none"
@@ -35,6 +35,7 @@ class ExperimentConfig:
     clf_lr_decay: float = 0.5
     clf_min_lr: float = 1e-5
     clf_early_stop_patience: int = 0
+    max_fallback_rate: float = 0.05
 
     @property
     def checkpoint_dir(self) -> Path:

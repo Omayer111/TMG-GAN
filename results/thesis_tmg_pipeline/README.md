@@ -139,6 +139,36 @@ python -u scripts/train_tmg_gan.py \
   --resume 2>&1 | tee -a "$LOG_FILE"
 ```
 
+### TMG recovery protocol scripts (Kaggle)
+
+The repository now includes three Kaggle-oriented scripts to run the conservative recovery matrix directly:
+
+- `scripts/run_tmg_kaggle_c1.sh`: fresh conservative run (quality-first synthetic augmentation)
+- `scripts/run_tmg_kaggle_c2.sh`: fresh conservative run + weighted classifier fine-tuning
+- `scripts/run_tmg_kaggle_c3_resume.sh`: resume validation run from best C1/C2 lineage
+
+Run order:
+
+1. Run C1 first.
+2. Run C2 with a unique `RUN_NAME`.
+3. Resume only the best lineage with C3.
+
+Example usage in Kaggle:
+
+```bash
+cd /kaggle/working/thesis_tmg_pipeline
+
+bash scripts/run_tmg_kaggle_c1.sh
+RUN_NAME=tmg_c2_weighted_v2 bash scripts/run_tmg_kaggle_c2.sh
+RUN_NAME=tmg_c2_weighted_v2 bash scripts/run_tmg_kaggle_c3_resume.sh
+```
+
+All three scripts enforce:
+
+- conservative target sizing: `--augmentation-target-mode second_max`
+- bounded synthetic ratio: `--max-synthetic-multiplier 1.5`
+- hard quality gating: `--strict-qualification-fallback --max-fallback-rate 0.05`
+
 ### Windows PowerShell wrapper (local)
 
 ```powershell
