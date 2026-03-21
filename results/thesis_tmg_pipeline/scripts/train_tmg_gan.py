@@ -6,13 +6,28 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from sklearn.metrics import confusion_matrix
+import torch.nn.functional as F
 from torch import nn
 from torch.nn.functional import cosine_similarity
 from torch.optim import Adam
-from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data import DataLoader, TensorDataset, WeightedRandomSampler
 
-import context
-from thesis_tmg_pipeline.src import CheckpointManager, ExperimentConfig, compute_metrics, load_dataset, set_random_state
+try:
+    from . import context
+except ImportError:
+    import context
+
+try:
+    from thesis_tmg_pipeline.src import CheckpointManager, ExperimentConfig, compute_metrics, load_dataset, set_random_state
+except ImportError:
+    # Kaggle syncs sometimes carry stale or partial src/__init__.py exports.
+    # Fall back to direct module imports to keep training script runnable.
+    from thesis_tmg_pipeline.src.checkpointing import CheckpointManager
+    from thesis_tmg_pipeline.src.config.settings import ExperimentConfig
+    from thesis_tmg_pipeline.src.data.tabular_loader import load_dataset
+    from thesis_tmg_pipeline.src.utils import compute_metrics, set_random_state
+
 from thesis_tmg_pipeline.src.models.tmg_cd_model_tabular import TMGGANCDModelTabular
 from thesis_tmg_pipeline.src.models.tmg_generator_tabular import TMGGANGeneratorTabular
 
@@ -60,7 +75,116 @@ def _build_class_weights(class_counts_after: list[int], mode: str, effective_num
     return weights / weights.mean()
 
 
-def evaluate_cd_model(model: TMGGANCDModelTabular, dl: DataLoader, device: torch.device) -> tuple[float, dict]:
+class FocalLoss(nn.Module):
+    def __init__(self, alpha: torch.Tensor | None = None, gamma: float = 2.0, reduction: str = "mean"):
+        super().__init__()
+        self.gamma = float(gamma)
+        self.reduction = reduction
+
+        if alpha is not None:
+            self.register_buffer("alpha", alpha.float())
+        else:
+            self.alpha = None
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        ce = F.cross_entropy(logits, targets, reduction="none")
+        pt = torch.exp(-ce).clamp_min(1e-8)
+
+        if self.alpha is None:
+            alpha_t = torch.ones_like(pt)
+        else:
+            alpha_t = self.alpha[targets]
+
+        loss = alpha_t * ((1.0 - pt) ** self.gamma) * ce
+
+        if self.reduction == "sum":
+            return loss.sum()
+        if self.reduction == "none":
+            return loss
+        return loss.mean()
+
+
+def _build_loader_kwargs(
+    batch_size: int,
+    num_workers: int,
+    pin_memory: bool,
+    persistent_workers: bool,
+    prefetch_factor: int,
+) -> dict:
+    kwargs = {
+        "batch_size": batch_size,
+        "num_workers": num_workers,
+        "pin_memory": pin_memory,
+    }
+    if num_workers > 0:
+        kwargs["persistent_workers"] = persistent_workers
+        kwargs["prefetch_factor"] = prefetch_factor
+    return kwargs
+
+
+def build_pretrain_loader(
+    train_dataset: TensorDataset,
+    num_classes: int,
+    batch_size: int,
+    num_workers: int,
+    pin_memory: bool,
+    persistent_workers: bool,
+    prefetch_factor: int,
+    use_balanced_sampler: bool,
+) -> tuple[DataLoader, torch.Tensor]:
+    labels = train_dataset.tensors[1].long()
+    class_counts = torch.bincount(labels, minlength=num_classes).float()
+
+    dl_kwargs = _build_loader_kwargs(
+        batch_size=batch_size,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        persistent_workers=persistent_workers,
+        prefetch_factor=prefetch_factor,
+    )
+
+    if use_balanced_sampler:
+        sample_weights = (1.0 / torch.clamp(class_counts, min=1.0))[labels]
+        sampler = WeightedRandomSampler(
+            weights=sample_weights.double(),
+            num_samples=len(labels),
+            replacement=True,
+        )
+        train_dl = DataLoader(train_dataset, sampler=sampler, shuffle=False, **dl_kwargs)
+    else:
+        train_dl = DataLoader(train_dataset, shuffle=True, **dl_kwargs)
+
+    return train_dl, class_counts
+
+
+def _per_class_recall_from_cm(cm: np.ndarray) -> list[float]:
+    if cm.size == 0:
+        return []
+    row_sums = cm.sum(axis=1)
+    recalls = np.divide(
+        np.diag(cm),
+        np.clip(row_sums, 1, None),
+        out=np.zeros_like(np.diag(cm), dtype=float),
+        where=row_sums > 0,
+    )
+    return [float(x) for x in recalls]
+
+
+def set_cd_freeze_state(cd_model, freeze_backbone: bool):
+    base_model = getattr(cd_model, "_orig_mod", cd_model)
+
+    for p in base_model.parameters():
+        p.requires_grad = True
+
+    if freeze_backbone:
+        for p in base_model.backbone.parameters():
+            p.requires_grad = False
+        if hasattr(base_model, "embedding_head"):
+            for p in base_model.embedding_head.parameters():
+                p.requires_grad = False
+
+
+def evaluate_cd_model(model: TMGGANCDModelTabular, dl: DataLoader, device: torch.device) -> tuple[float, dict, np.ndarray]:
     model.eval()
     criterion = nn.CrossEntropyLoss()
     loss_sum = 0.0
@@ -94,15 +218,16 @@ def evaluate_cd_model(model: TMGGANCDModelTabular, dl: DataLoader, device: torch
             "Recall": float("nan"),
             "F1": float("nan"),
             "Accuracy": float("nan"),
-        }
+        }, np.array([])
 
     y_true_np = np.concatenate(y_true)
     y_pred_np = np.concatenate(y_pred)
     metrics = compute_metrics(y_true_np, y_pred_np)
     mean_loss = loss_sum / valid_samples
+    cm = confusion_matrix(y_true_np, y_pred_np)
     if skipped_batches > 0:
         print(f"WARNING: evaluate_cd_model skipped {skipped_batches} non-finite batches.")
-    return mean_loss, metrics
+    return mean_loss, metrics, cm
 
 
 def split_by_class(x_train: torch.Tensor, y_train: torch.Tensor, num_classes: int) -> list[torch.Tensor]:
@@ -119,6 +244,50 @@ def split_by_class(x_train: torch.Tensor, y_train: torch.Tensor, num_classes: in
 def sample_real_batch(class_samples: torch.Tensor, batch_size: int, device: torch.device) -> torch.Tensor:
     indices = torch.randint(0, len(class_samples), (batch_size,))
     return class_samples[indices].to(device, non_blocking=True)
+
+
+def debug_real_class_predictions(samples_per_class, cd_model, num_classes, device, batch_size=512):
+    cd_model.eval()
+    print("Real-sample prediction debug:")
+    stats = {}
+
+    with torch.no_grad():
+        for class_id in range(num_classes):
+            real = sample_real_batch(samples_per_class[class_id], batch_size, device)
+            _, logits, _ = cd_model(real)
+            pred = torch.argmax(logits, dim=1)
+            counts = torch.bincount(pred, minlength=num_classes).cpu().tolist()
+            total = sum(counts)
+            match_rate = counts[class_id] / total if total > 0 else 0.0
+            print(f"  Real[{class_id}] predicted class histogram: {counts} (match_rate={match_rate:.3f})")
+            stats[str(class_id)] = {
+                "pred_hist": counts,
+                "match_rate": float(match_rate),
+            }
+
+    return stats
+
+
+def debug_fake_class_predictions(generators, cd_model, num_classes, device, batch_size=512):
+    cd_model.eval()
+    print("Fake-sample prediction debug (post-GAN):")
+    stats = {}
+
+    with torch.no_grad():
+        for class_id in range(num_classes):
+            fake = generators[class_id].sample(batch_size, device=device)
+            _, logits, _ = cd_model(fake)
+            pred = torch.argmax(logits, dim=1)
+            counts = torch.bincount(pred, minlength=num_classes).cpu().tolist()
+            total = sum(counts)
+            match_rate = counts[class_id] / total if total > 0 else 0.0
+            print(f"  Fake[{class_id}] predicted class histogram: {counts} (match_rate={match_rate:.3f})")
+            stats[str(class_id)] = {
+                "pred_hist": counts,
+                "match_rate": float(match_rate),
+            }
+
+    return stats
 
 
 def generate_qualified_samples(
@@ -268,6 +437,114 @@ def build_augmented_dataset(
 
     return TensorDataset(x_aug, y_aug), class_counts.cpu().numpy().astype(int).tolist(), class_counts_after, qualification_stats
 
+def pretrain_cd_model(
+    cd_model,
+    train_dataset,
+    test_dl,
+    device,
+    num_classes,
+    epochs,
+    lr,
+    use_amp,
+    max_grad_norm,
+    eval_interval,
+    batch_size,
+    num_workers,
+    pin_memory,
+    persistent_workers,
+    prefetch_factor,
+    pretrain_loss,
+    focal_gamma,
+    use_balanced_sampler,
+):
+    print(f"Starting CD pretraining for {epochs} epochs...")
+
+    train_dl, class_counts = build_pretrain_loader(
+        train_dataset=train_dataset,
+        num_classes=num_classes,
+        batch_size=batch_size,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        persistent_workers=persistent_workers,
+        prefetch_factor=prefetch_factor,
+        use_balanced_sampler=use_balanced_sampler,
+    )
+
+    class_weights = class_counts.sum() / (num_classes * torch.clamp(class_counts, min=1.0))
+    class_weights = class_weights / class_weights.mean()
+    class_weights = class_weights.to(device)
+
+    if pretrain_loss == "ce":
+        criterion = nn.CrossEntropyLoss(weight=class_weights)
+    elif pretrain_loss == "focal":
+        criterion = FocalLoss(alpha=None, gamma=focal_gamma)
+    elif pretrain_loss == "cb_focal":
+        criterion = FocalLoss(alpha=class_weights, gamma=focal_gamma)
+    else:
+        raise ValueError(f"Unknown pretrain_loss: {pretrain_loss}")
+
+    optimizer = torch.optim.Adam(cd_model.parameters(), lr=lr)
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp and device.type == "cuda")
+
+    best_f1 = -1.0
+    best_state = None
+
+    print(
+        f"CD pretraining setup | loss={pretrain_loss} | gamma={focal_gamma} | "
+        f"balanced_sampler={use_balanced_sampler} | class_counts={class_counts.tolist()}"
+    )
+
+    for epoch in range(epochs):
+        cd_model.train()
+        losses = []
+
+        for x, y in train_dl:
+            x = x.to(device, non_blocking=True)
+            y = y.to(device, non_blocking=True)
+
+            optimizer.zero_grad(set_to_none=True)
+
+            with torch.autocast(device_type=device.type, enabled=use_amp and device.type == "cuda"):
+                _, logits, _ = cd_model(x)
+                loss = criterion(logits, y)
+
+            if torch.isfinite(loss):
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(cd_model.parameters(), max_grad_norm)
+                scaler.step(optimizer)
+                scaler.update()
+                losses.append(float(loss.item()))
+
+        mean_loss = float(np.mean(losses)) if losses else float("nan")
+
+        if (epoch + 1) % eval_interval == 0 or epoch == 0 or epoch == epochs - 1:
+            eval_loss, eval_metrics, eval_cm = evaluate_cd_model(cd_model, test_dl, device)
+            f1 = float(eval_metrics.get("F1", 0.0))
+            per_class_recall = _per_class_recall_from_cm(eval_cm)
+
+            print(
+                f"CD Pretrain Epoch {epoch+1}/{epochs} | "
+                f"TrainLoss {mean_loss:.4f} | EvalLoss {eval_loss:.4f} | F1 {f1:.4f}"
+            )
+            print("Confusion Matrix:")
+            print(eval_cm)
+            print(f"Per-class recall: {[round(v, 4) for v in per_class_recall]}")
+
+            if f1 > best_f1:
+                best_f1 = f1
+                best_state = {
+                    k: v.detach().cpu().clone()
+                    for k, v in cd_model.state_dict().items()
+                }
+
+    if best_state is not None:
+        cd_model.load_state_dict(best_state)
+        print(f"Loaded best pretrained CD model with F1={best_f1:.4f}")
+
+    return cd_model
+
+
 
 def train(
     config: ExperimentConfig,
@@ -319,7 +596,13 @@ def train(
 
     samples_per_class = split_by_class(data["x_train"], data["y_train"], num_classes)
 
-    cd_model = TMGGANCDModelTabular(feature_dim=feature_dim, num_classes=num_classes, hidden_dim=gan_hidden_dim).to(device)
+    cd_model = TMGGANCDModelTabular(
+        feature_dim=feature_dim,
+        num_classes=num_classes,
+        hidden_dim=gan_hidden_dim,
+        embedding_dim=config.embedding_dim,
+        dropout=config.cd_dropout,
+    ).to(device)
     generators = [
         TMGGANGeneratorTabular(z_dim=z_dim, feature_dim=feature_dim, hidden_dim=gan_hidden_dim).to(device)
         for _ in range(num_classes)
@@ -333,7 +616,11 @@ def train(
     g_optimizers = [Adam(g.parameters(), lr=gan_lr, betas=(0.5, 0.999)) for g in generators]
     clf_optimizer = Adam(cd_model.parameters(), lr=config.learning_rate)
 
-    ce = nn.CrossEntropyLoss()
+    class_counts = torch.bincount(data["y_train"], minlength=num_classes).float()
+    gan_class_weights = class_counts.sum() / (num_classes * torch.clamp(class_counts, min=1.0))
+    gan_class_weights = gan_class_weights / gan_class_weights.mean()
+    gan_class_weights = gan_class_weights.to(device)
+    ce = nn.CrossEntropyLoss(weight=gan_class_weights)
     cd_scaler = torch.amp.GradScaler("cuda", enabled=config.use_amp and device.type == "cuda")
     g_scalers = [torch.amp.GradScaler("cuda", enabled=config.use_amp and device.type == "cuda") for _ in generators]
     clf_scaler = torch.amp.GradScaler("cuda", enabled=config.use_amp and device.type == "cuda")
@@ -380,12 +667,107 @@ def train(
                 print("WARNING: rng_state missing from checkpoint. Continuing with fresh RNG state.")
             print(f"Resumed from phase={phase}, gan_epoch={gan_start_epoch}, clf_epoch={clf_start_epoch}")
 
+    loaded_pretrained_cd = False
+    if config.load_pretrained_cd:
+        ckpt = torch.load(config.load_pretrained_cd, map_location=device, weights_only=False)
+        cd_model.load_state_dict(ckpt["cd_model_state"])
+        loaded_pretrained_cd = True
+        print(f"Loaded pretrained CD checkpoint from {config.load_pretrained_cd}")
+
+    should_run_pretrain = (
+        (phase == "gan")
+        and (gan_start_epoch == 0)
+        and (config.pretrain_cd_epochs > 0)
+        and (not loaded_pretrained_cd)
+    )
+    if should_run_pretrain:
+        cd_model = pretrain_cd_model(
+            cd_model=cd_model,
+            train_dataset=data["train_dataset"],
+            test_dl=test_dl,
+            device=device,
+            num_classes=num_classes,
+            epochs=config.pretrain_cd_epochs,
+            lr=config.pretrain_cd_lr,
+            use_amp=config.use_amp,
+            max_grad_norm=max_grad_norm,
+            eval_interval=config.pretrain_eval_interval,
+            batch_size=config.batch_size,
+            num_workers=config.num_workers,
+            pin_memory=config.pin_memory and device.type == "cuda",
+            persistent_workers=config.persistent_workers,
+            prefetch_factor=config.prefetch_factor,
+            pretrain_loss=config.pretrain_loss,
+            focal_gamma=config.focal_gamma,
+            use_balanced_sampler=config.use_balanced_sampler,
+        )
+
+        config.metrics_dir.mkdir(parents=True, exist_ok=True)
+        pretrain_real_debug = debug_real_class_predictions(samples_per_class, cd_model, num_classes, device)
+
+        with open(config.metrics_dir / f"{config.run_name}_pretrain_real_debug.json", "w", encoding="utf-8") as f:
+            json.dump(pretrain_real_debug, f, indent=2)
+
+        config.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        pretrained_cd_path = config.checkpoint_dir / f"{config.run_name}_pretrained_cd.pt"
+
+        torch.save(
+            {
+                "cd_model_state": cd_model.state_dict(),
+                "feature_dim": feature_dim,
+                "num_classes": num_classes,
+                "gan_hidden_dim": gan_hidden_dim,
+                "embedding_dim": config.embedding_dim,
+                "cd_dropout": config.cd_dropout,
+            },
+            pretrained_cd_path,
+        )
+
+        print(f"Saved pretrained CD checkpoint to {pretrained_cd_path}")
+
+        if config.pretrain_cd_only or config.save_pretrained_cd_only:
+            print("Stopping after CD pretraining.")
+            return
+
+    if config.pretrain_cd_only:
+        if should_run_pretrain:
+            print("Stopping after CD pretraining because --pretrain-cd-only was set.")
+        else:
+            print("Skipping --pretrain-cd-only because pretraining did not run (likely resume from checkpoint).")
+        return
+
     config.metrics_dir.mkdir(parents=True, exist_ok=True)
     metrics_path = config.metrics_dir / f"{config.run_name}.json"
 
     if phase == "gan" and gan_start_epoch < gan_epochs:
+        generator_steps_by_class = {class_id: g_steps for class_id in range(num_classes)}
+        if 2 < num_classes:
+            generator_steps_by_class[2] = config.g_steps_c2
+        if 3 < num_classes:
+            generator_steps_by_class[3] = config.g_steps_c3
+        if 4 < num_classes:
+            generator_steps_by_class[4] = config.g_steps_c4
+        if 5 < num_classes:
+            generator_steps_by_class[5] = config.g_steps_c5
+        print(f"Generator steps by class: {generator_steps_by_class}")
+
+        freeze_backbone_active = gan_start_epoch < config.cd_freeze_backbone_epochs
+        set_cd_freeze_state(cd_model, freeze_backbone=freeze_backbone_active)
+        if freeze_backbone_active:
+            print(
+                f"Freezing CD backbone/embedding for first {config.cd_freeze_backbone_epochs} GAN epochs "
+                f"(starting at epoch index {gan_start_epoch})."
+            )
+        else:
+            print("CD backbone/embedding starts unfrozen for GAN phase.")
+
         nan_count = 0
         for gan_epoch in range(gan_start_epoch, gan_epochs):
+            if freeze_backbone_active and gan_epoch == config.cd_freeze_backbone_epochs:
+                set_cd_freeze_state(cd_model, freeze_backbone=False)
+                freeze_backbone_active = False
+                print(f"Unfroze full CD model after epoch {config.cd_freeze_backbone_epochs}.")
+
             cd_model.train()
             for gen in generators:
                 gen.train()
@@ -427,24 +809,44 @@ def train(
                         nan_count += 1
 
                 # --- Train G (t_g steps per paper Algorithm 1 lines 8-13) ---
-                for _ in range(g_steps):
+                class_g_steps = generator_steps_by_class[class_id]
+                for _ in range(class_g_steps):
                     g_optimizers[class_id].zero_grad(set_to_none=True)
+
                     with torch.autocast(device_type=device.type, enabled=config.use_amp and device.type == "cuda"):
                         real_batch = sample_real_batch(samples_per_class[class_id], config.batch_size, device)
-                        _, _, hidden_real = cd_model(real_batch)
+                        _, _, hidden_real_k = cd_model(real_batch)
 
                         fake_batch = generators[class_id].sample(config.batch_size, device=device)
-                        score_fake, pred_fake, hidden_fake = cd_model(fake_batch)
+                        score_fake, pred_fake, hidden_fake_k = cd_model(fake_batch)
 
-                        # Paper: -D(fake) + CE(pred_fake, target) + O_k
                         label_loss = ce(pred_fake, class_target)
-                        # Paper Eq. 4: cosine similarity between hidden features
-                        if gan_epoch < hidden_warmup_epochs:
-                            hidden_loss = torch.zeros(1, device=device, dtype=score_fake.dtype).squeeze(0)
-                        else:
-                            hidden_loss = -cosine_similarity(hidden_real.detach(), hidden_fake, dim=1).mean()
 
-                        g_loss = -score_fake.mean() + label_loss + hidden_loss_weight * hidden_loss
+                        if gan_epoch < hidden_warmup_epochs:
+                            separation_loss = torch.zeros(1, device=device, dtype=score_fake.dtype).squeeze(0)
+                        else:
+                            same_class_term = cosine_similarity(
+                                hidden_fake_k, hidden_real_k.detach(), dim=1
+                            ).mean()
+
+                            other_terms = []
+                            for other_id in range(num_classes):
+                                if other_id == class_id:
+                                    continue
+                                with torch.no_grad():
+                                    fake_other = generators[other_id].sample(config.batch_size, device=device)
+                                    _, _, hidden_fake_other = cd_model(fake_other)
+                                other_terms.append(
+                                    cosine_similarity(hidden_fake_k, hidden_fake_other.detach(), dim=1).mean()
+                                )
+
+                            inter_class_term = torch.stack(other_terms).mean() if other_terms else torch.zeros(
+                                1, device=device, dtype=score_fake.dtype
+                            ).squeeze(0)
+
+                            separation_loss = inter_class_term - same_class_term
+
+                        g_loss = -score_fake.mean() + label_loss + hidden_loss_weight * separation_loss
 
                     if torch.isfinite(g_loss):
                         g_scalers[class_id].scale(g_loss).backward()
@@ -458,32 +860,6 @@ def train(
                         g_optimizers[class_id].zero_grad(set_to_none=True)
                         nan_count += 1
 
-            # --- Inter-generator diversity loss (original code lines 79-98) ---
-            # Paper: penalize cosine similarity between different generators' hidden states
-            # Normalized by feature_dim as in original code
-            for opt in g_optimizers:
-                opt.zero_grad(set_to_none=True)
-            hidden_vectors = []
-            for gen in generators:
-                _ = gen.sample(3, device=device)
-                hidden_vectors.append(gen.hidden_status)
-
-            diversity_terms = []
-            for i in range(len(hidden_vectors)):
-                for j in range(len(hidden_vectors)):
-                    if i != j:
-                        diversity_terms.append(
-                            cosine_similarity(hidden_vectors[i], hidden_vectors[j], dim=1)
-                        )
-
-            if diversity_terms:
-                diversity_loss = torch.cat(diversity_terms).mean() / feature_dim
-                if torch.isfinite(diversity_loss):
-                    diversity_loss.backward()
-                    for i_opt, optimizer in enumerate(g_optimizers):
-                        torch.nn.utils.clip_grad_norm_(generators[i_opt].parameters(), max_grad_norm)
-                        optimizer.step()
-
             if nan_count > 50:
                 print(f"ABORT: {nan_count} consecutive NaN losses detected at GAN epoch {gan_epoch + 1}.")
                 break
@@ -494,7 +870,7 @@ def train(
             # Periodic GAN-phase evaluation
             gan_eval_metrics = {}
             if gan_eval_interval > 0 and ((gan_epoch + 1) % gan_eval_interval == 0):
-                eval_loss, gan_eval_metrics = evaluate_cd_model(cd_model, test_dl, device)
+                eval_loss, gan_eval_metrics, _ = evaluate_cd_model(cd_model, test_dl, device)
                 cd_model.train()
                 for gen in generators:
                     gen.train()
@@ -503,6 +879,10 @@ def train(
                     f"Loss {eval_loss:.4f} | F1 {gan_eval_metrics.get('F1', 0):.4f}"
                 )
 
+            should_save_gan_epoch = (
+                (config.checkpoint_interval > 0 and ((gan_epoch + 1) % config.checkpoint_interval == 0))
+                or (gan_epoch + 1 == gan_epochs)
+            )
             manager.save(
                 payload={
                     "phase": "gan",
@@ -528,14 +908,20 @@ def train(
                         "gan_hidden_dim": gan_hidden_dim,
                         "cd_steps": cd_steps,
                         "g_steps": g_steps,
+                        "g_steps_c2": config.g_steps_c2,
+                        "g_steps_c3": config.g_steps_c3,
+                        "g_steps_c4": config.g_steps_c4,
+                        "g_steps_c5": config.g_steps_c5,
                         "gen_batch_size": gen_batch_size,
                         "hidden_warmup_epochs": hidden_warmup_epochs,
                         "hidden_loss_weight": hidden_loss_weight,
+                        "cd_freeze_backbone_epochs": config.cd_freeze_backbone_epochs,
                         "max_rejects": max_rejects,
                     },
                 },
                 epoch=gan_epoch + 1,
                 is_best=False,
+                save_epoch_checkpoint=should_save_gan_epoch,
             )
 
             print(
@@ -545,6 +931,21 @@ def train(
 
         phase = "clf"
         clf_start_epoch = 0
+
+    # Show how well the CD model and generators align before qualification
+    post_gan_real_debug = debug_real_class_predictions(samples_per_class, cd_model, num_classes, device)
+    post_gan_fake_debug = debug_fake_class_predictions(generators, cd_model, num_classes, device)
+
+    config.metrics_dir.mkdir(parents=True, exist_ok=True)
+    with open(config.metrics_dir / f"{config.run_name}_gan_alignment_debug.json", "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "real_debug": post_gan_real_debug,
+                "fake_debug": post_gan_fake_debug,
+            },
+            f,
+            indent=2,
+        )
 
     augmented_train_dataset, class_counts_before, class_counts_after, qualification_stats = build_augmented_dataset(
         generators=generators,
@@ -643,7 +1044,7 @@ def train(
 
         is_best = False
         if should_evaluate:
-            test_loss, test_metrics = evaluate_cd_model(cd_model, test_dl, device)
+            test_loss, test_metrics, _ = evaluate_cd_model(cd_model, test_dl, device)
             f1_value = float(test_metrics["F1"])
             is_best = math.isfinite(f1_value) and (f1_value > best_f1)
             scheduler_signal = f1_value if math.isfinite(f1_value) else -1.0
@@ -683,9 +1084,14 @@ def train(
                         "gan_hidden_dim": gan_hidden_dim,
                         "cd_steps": cd_steps,
                         "g_steps": g_steps,
+                        "g_steps_c2": config.g_steps_c2,
+                        "g_steps_c3": config.g_steps_c3,
+                        "g_steps_c4": config.g_steps_c4,
+                        "g_steps_c5": config.g_steps_c5,
                         "gen_batch_size": gen_batch_size,
                         "hidden_warmup_epochs": hidden_warmup_epochs,
                         "hidden_loss_weight": hidden_loss_weight,
+                        "cd_freeze_backbone_epochs": config.cd_freeze_backbone_epochs,
                         "max_rejects": max_rejects,
                     },
                     "qualification_stats": qualification_stats,
@@ -764,6 +1170,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gan-hidden-dim", type=int, default=512)
     parser.add_argument("--cd-steps", type=int, default=5)
     parser.add_argument("--g-steps", type=int, default=1)
+    parser.add_argument("--g-steps-c2", type=int, default=2)
+    parser.add_argument("--g-steps-c3", type=int, default=3)
+    parser.add_argument("--g-steps-c4", type=int, default=4)
+    parser.add_argument("--g-steps-c5", type=int, default=4)
     parser.add_argument("--gen-batch-size", type=int, default=1024)
     parser.add_argument("--hidden-warmup-epochs", type=int, default=1000)
     parser.add_argument("--hidden-loss-weight", type=float, default=1.0)
@@ -795,6 +1205,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-amp", action="store_true")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--reset-clf-optimizer-on-resume", action="store_true", help="When resuming from CLF phase, ignore saved CLF optimizer/scaler state")
+    
+    parser.add_argument("--pretrain-cd-epochs", type=int, default=30)
+    parser.add_argument("--pretrain-cd-lr", type=float, default=1e-3)
+    parser.add_argument("--pretrain-cd-only", action="store_true")
+    parser.add_argument("--pretrain-eval-interval", type=int, default=5)
+    parser.add_argument("--load-pretrained-cd", type=str, default="")
+    parser.add_argument("--save-pretrained-cd-only", action="store_true")
+    parser.add_argument("--pretrain-loss", type=str, default="cb_focal", choices=["ce", "focal", "cb_focal"])
+    parser.add_argument("--focal-gamma", type=float, default=2.0)
+    parser.add_argument("--no-balanced-sampler", action="store_true")
+    parser.add_argument("--cd-dropout", type=float, default=0.15)
+    parser.add_argument("--embedding-dim", type=int, default=128)
+    parser.add_argument("--cd-freeze-backbone-epochs", type=int, default=10)
+    
+    
     return parser.parse_args()
 
 
@@ -833,6 +1258,22 @@ if __name__ == "__main__":
         clf_min_lr=args.clf_min_lr,
         clf_early_stop_patience=args.clf_early_stop_patience,
         max_fallback_rate=args.max_fallback_rate,
+        pretrain_cd_epochs=args.pretrain_cd_epochs,
+        pretrain_cd_lr=args.pretrain_cd_lr,
+        pretrain_cd_only=args.pretrain_cd_only,
+        pretrain_eval_interval=args.pretrain_eval_interval,
+        load_pretrained_cd=args.load_pretrained_cd,
+        save_pretrained_cd_only=args.save_pretrained_cd_only,
+        pretrain_loss=args.pretrain_loss,
+        focal_gamma=args.focal_gamma,
+        use_balanced_sampler=not args.no_balanced_sampler,
+        cd_dropout=args.cd_dropout,
+        embedding_dim=args.embedding_dim,
+        cd_freeze_backbone_epochs=args.cd_freeze_backbone_epochs,
+        g_steps_c2=args.g_steps_c2,
+        g_steps_c3=args.g_steps_c3,
+        g_steps_c4=args.g_steps_c4,
+        g_steps_c5=args.g_steps_c5,
     )
 
     train(

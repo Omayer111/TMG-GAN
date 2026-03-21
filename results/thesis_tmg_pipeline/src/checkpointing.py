@@ -17,9 +17,16 @@ class CheckpointManager:
         torch.save(payload, tmp_path)
         os.replace(tmp_path, path)
 
-    def save(self, payload: dict, epoch: int, is_best: bool = False) -> None:
-        epoch_path = self.checkpoint_dir / f"epoch_{epoch:04d}.pt"
-        self._atomic_save(payload, epoch_path)
+    def save(
+        self,
+        payload: dict,
+        epoch: int,
+        is_best: bool = False,
+        save_epoch_checkpoint: bool = True,
+    ) -> None:
+        if save_epoch_checkpoint:
+            epoch_path = self.checkpoint_dir / f"epoch_{epoch:04d}.pt"
+            self._atomic_save(payload, epoch_path)
         self._atomic_save(payload, self.latest_path)
         if is_best:
             self._atomic_save(payload, self.checkpoint_dir / "best.pt")
