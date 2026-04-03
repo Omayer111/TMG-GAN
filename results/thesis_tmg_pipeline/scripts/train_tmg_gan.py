@@ -184,6 +184,57 @@ def set_cd_freeze_state(cd_model, freeze_backbone: bool):
                 p.requires_grad = False
 
 
+def compute_real_class_prototypes(
+    cd_model: TMGGANCDModelTabular,
+    samples_per_class: list[torch.Tensor],
+    device: torch.device,
+    batch_size: int = 1024,
+) -> torch.Tensor:
+    """
+    Returns normalized class prototypes in CD embedding space.
+    Shape: [num_classes, embedding_dim]
+    """
+    cd_model.eval()
+    prototypes = []
+
+    with torch.no_grad():
+        for class_id, class_samples in enumerate(samples_per_class):
+            take = min(batch_size, len(class_samples))
+            real_batch = sample_real_batch(class_samples, take, device)
+            _, _, hidden = cd_model(real_batch)
+            proto = F.normalize(hidden.mean(dim=0), dim=0)
+            prototypes.append(proto)
+
+    return torch.stack(prototypes, dim=0)
+
+
+def compute_prototype_losses(
+    fake_hidden: torch.Tensor,
+    class_id: int,
+    class_prototypes: torch.Tensor,
+    margin: float = 0.20,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Returns:
+      pull_loss: make fake close to own class prototype
+      push_loss: push fake away from nearest wrong prototype
+      max_wrong_sim: diagnostic scalar
+    """
+    fake_hidden_n = F.normalize(fake_hidden, dim=1)
+    own_proto = class_prototypes[class_id].unsqueeze(0)  # [1, D]
+
+    own_sim = (fake_hidden_n * own_proto).sum(dim=1)  # [B]
+    pull_loss = (1.0 - own_sim).mean()
+
+    all_sims = fake_hidden_n @ class_prototypes.t()  # [B, C]
+    wrong_sims = all_sims.clone()
+    wrong_sims[:, class_id] = -1e9
+    max_wrong_sim, _ = wrong_sims.max(dim=1)
+
+    push_loss = F.relu(max_wrong_sim - own_sim + margin).mean()
+    return pull_loss, push_loss, max_wrong_sim.mean()
+
+
 def evaluate_cd_model(model: TMGGANCDModelTabular, dl: DataLoader, device: torch.device) -> tuple[float, dict, np.ndarray]:
     model.eval()
     criterion = nn.CrossEntropyLoss()
@@ -740,16 +791,34 @@ def train(
     metrics_path = config.metrics_dir / f"{config.run_name}.json"
 
     if phase == "gan" and gan_start_epoch < gan_epochs:
-        generator_steps_by_class = {class_id: g_steps for class_id in range(num_classes)}
-        if 2 < num_classes:
-            generator_steps_by_class[2] = config.g_steps_c2
-        if 3 < num_classes:
-            generator_steps_by_class[3] = config.g_steps_c3
-        if 4 < num_classes:
-            generator_steps_by_class[4] = config.g_steps_c4
-        if 5 < num_classes:
-            generator_steps_by_class[5] = config.g_steps_c5
-        print(f"Generator steps by class: {generator_steps_by_class}")
+        # Class-weighted generator classification loss for minority-class targeting
+        generator_cls_weight_by_class = {
+            0: 1.0,
+            1: 1.0,
+            2: 1.5,
+            3: 4.0,
+            4: 1.0,
+            5: 1.0,
+        }
+        print(f"Generator classification weight by class: {generator_cls_weight_by_class}")
+
+        generator_fm_weight_by_class = {
+            0: 1.0,
+            1: 1.0,
+            2: 2.0,
+            3: 4.0,
+            4: 6.0,
+            5: 6.0,
+        }
+        print(f"Generator FM weight by class: {generator_fm_weight_by_class}")
+
+        class_prototypes = compute_real_class_prototypes(
+            cd_model=cd_model,
+            samples_per_class=samples_per_class,
+            device=device,
+            batch_size=min(1024, config.batch_size * 8),
+        )
+        print(f"Initialized real class prototypes with shape={tuple(class_prototypes.shape)}")
 
         freeze_backbone_active = gan_start_epoch < config.cd_freeze_backbone_epochs
         set_cd_freeze_state(cd_model, freeze_backbone=freeze_backbone_active)
@@ -761,8 +830,95 @@ def train(
         else:
             print("CD backbone/embedding starts unfrozen for GAN phase.")
 
+        hard_classes = [class_id for class_id in (3,) if class_id < num_classes]
+        extra_hard_g_steps = 4
+        print(f"Hard-class focus: {hard_classes} | extra_hard_g_steps={extra_hard_g_steps}")
+
+        def train_generator_for_class(class_id: int) -> bool:
+            class_target = torch.full((config.batch_size,), class_id, dtype=torch.long, device=device)
+            g_optimizers[class_id].zero_grad(set_to_none=True)
+
+            with torch.autocast(device_type=device.type, enabled=config.use_amp and device.type == "cuda"):
+                real_batch = sample_real_batch(samples_per_class[class_id], config.batch_size, device)
+                # Real target-class embedding anchor
+                with torch.no_grad():
+                    _, _, hidden_real_k = cd_model(real_batch)
+
+                fake_batch = generators[class_id].sample(config.batch_size, device=device)
+                score_fake, pred_fake, hidden_fake_k = cd_model(fake_batch)
+
+                label_loss = ce(pred_fake, class_target)
+                cls_weight = generator_cls_weight_by_class.get(class_id, 1.0)
+                proto_pull_loss, proto_push_loss, max_wrong_proto_sim = compute_prototype_losses(
+                    fake_hidden=hidden_fake_k,
+                    class_id=class_id,
+                    class_prototypes=class_prototypes.detach(),
+                    margin=config.prototype_margin,
+                )
+
+                if gan_epoch < hidden_warmup_epochs:
+                    separation_loss = torch.zeros(1, device=device, dtype=score_fake.dtype).squeeze(0)
+                else:
+                    same_class_term = cosine_similarity(
+                        hidden_fake_k, hidden_real_k.detach(), dim=1
+                    ).mean()
+
+                    other_terms = []
+                    for other_id in range(num_classes):
+                        if other_id == class_id:
+                            continue
+                        with torch.no_grad():
+                            real_other = sample_real_batch(samples_per_class[other_id], config.batch_size, device)
+                            _, _, hidden_real_other = cd_model(real_other)
+                        other_terms.append(
+                            cosine_similarity(hidden_fake_k, hidden_real_other.detach(), dim=1).mean()
+                        )
+
+                    inter_class_term = torch.stack(other_terms).mean() if other_terms else torch.zeros(
+                        1, device=device, dtype=score_fake.dtype
+                    ).squeeze(0)
+
+                    separation_loss = inter_class_term - same_class_term
+
+                g_loss = (
+                    -score_fake.mean()
+                    + cls_weight * label_loss
+                    + hidden_loss_weight * separation_loss
+                    + config.prototype_pull_weight * proto_pull_loss
+                    + config.prototype_push_weight * proto_push_loss
+                )
+
+            if torch.isfinite(g_loss):
+                g_scalers[class_id].scale(g_loss).backward()
+                g_scalers[class_id].unscale_(g_optimizers[class_id])
+                torch.nn.utils.clip_grad_norm_(generators[class_id].parameters(), max_grad_norm)
+                g_scalers[class_id].step(g_optimizers[class_id])
+                g_scalers[class_id].update()
+                g_losses.append(float(g_loss.item()))
+                sep_losses.append(float(separation_loss.item()))
+                proto_pull_losses.append(float(proto_pull_loss.item()))
+                proto_push_losses.append(float(proto_push_loss.item()))
+                max_wrong_proto_sims.append(float(max_wrong_proto_sim.item()))
+                per_class_proto_logs[str(class_id)]["proto_pull"].append(float(proto_pull_loss.item()))
+                per_class_proto_logs[str(class_id)]["proto_push"].append(float(proto_push_loss.item()))
+                per_class_proto_logs[str(class_id)]["max_wrong_proto"].append(float(max_wrong_proto_sim.item()))
+                per_class_proto_logs[str(class_id)]["label_loss"].append(float(label_loss.item()))
+                return True
+
+            g_optimizers[class_id].zero_grad(set_to_none=True)
+            return False
+
         nan_count = 0
         for gan_epoch in range(gan_start_epoch, gan_epochs):
+            refresh_interval = max(1, int(config.prototype_refresh_interval))
+            if (gan_epoch % refresh_interval) == 0:
+                class_prototypes = compute_real_class_prototypes(
+                    cd_model=cd_model,
+                    samples_per_class=samples_per_class,
+                    device=device,
+                    batch_size=min(1024, config.batch_size * 8),
+                )
+
             if freeze_backbone_active and gan_epoch == config.cd_freeze_backbone_epochs:
                 set_cd_freeze_state(cd_model, freeze_backbone=False)
                 freeze_backbone_active = False
@@ -774,6 +930,19 @@ def train(
 
             cd_losses = []
             g_losses = []
+            sep_losses = []
+            proto_pull_losses = []
+            proto_push_losses = []
+            max_wrong_proto_sims = []
+            per_class_proto_logs = {
+                str(class_id): {
+                    "proto_pull": [],
+                    "proto_push": [],
+                    "max_wrong_proto": [],
+                    "label_loss": [],
+                }
+                for class_id in range(num_classes)
+            }
 
             class_order = list(range(num_classes))
             random.shuffle(class_order)
@@ -809,56 +978,18 @@ def train(
                         nan_count += 1
 
                 # --- Train G (t_g steps per paper Algorithm 1 lines 8-13) ---
-                class_g_steps = generator_steps_by_class[class_id]
-                for _ in range(class_g_steps):
-                    g_optimizers[class_id].zero_grad(set_to_none=True)
-
-                    with torch.autocast(device_type=device.type, enabled=config.use_amp and device.type == "cuda"):
-                        real_batch = sample_real_batch(samples_per_class[class_id], config.batch_size, device)
-                        _, _, hidden_real_k = cd_model(real_batch)
-
-                        fake_batch = generators[class_id].sample(config.batch_size, device=device)
-                        score_fake, pred_fake, hidden_fake_k = cd_model(fake_batch)
-
-                        label_loss = ce(pred_fake, class_target)
-
-                        if gan_epoch < hidden_warmup_epochs:
-                            separation_loss = torch.zeros(1, device=device, dtype=score_fake.dtype).squeeze(0)
-                        else:
-                            same_class_term = cosine_similarity(
-                                hidden_fake_k, hidden_real_k.detach(), dim=1
-                            ).mean()
-
-                            other_terms = []
-                            for other_id in range(num_classes):
-                                if other_id == class_id:
-                                    continue
-                                with torch.no_grad():
-                                    fake_other = generators[other_id].sample(config.batch_size, device=device)
-                                    _, _, hidden_fake_other = cd_model(fake_other)
-                                other_terms.append(
-                                    cosine_similarity(hidden_fake_k, hidden_fake_other.detach(), dim=1).mean()
-                                )
-
-                            inter_class_term = torch.stack(other_terms).mean() if other_terms else torch.zeros(
-                                1, device=device, dtype=score_fake.dtype
-                            ).squeeze(0)
-
-                            separation_loss = inter_class_term - same_class_term
-
-                        g_loss = -score_fake.mean() + label_loss + hidden_loss_weight * separation_loss
-
-                    if torch.isfinite(g_loss):
-                        g_scalers[class_id].scale(g_loss).backward()
-                        g_scalers[class_id].unscale_(g_optimizers[class_id])
-                        torch.nn.utils.clip_grad_norm_(generators[class_id].parameters(), max_grad_norm)
-                        g_scalers[class_id].step(g_optimizers[class_id])
-                        g_scalers[class_id].update()
-                        g_losses.append(float(g_loss.item()))
+                for _ in range(g_steps):
+                    if train_generator_for_class(class_id):
                         nan_count = 0
                     else:
-                        g_optimizers[class_id].zero_grad(set_to_none=True)
                         nan_count += 1
+
+                if class_id in hard_classes:
+                    for _ in range(extra_hard_g_steps):
+                        if train_generator_for_class(class_id):
+                            nan_count = 0
+                        else:
+                            nan_count += 1
 
             if nan_count > 50:
                 print(f"ABORT: {nan_count} consecutive NaN losses detected at GAN epoch {gan_epoch + 1}.")
@@ -866,6 +997,10 @@ def train(
 
             last_cd_loss = float(np.mean(cd_losses)) if cd_losses else float("nan")
             last_g_loss = float(np.mean(g_losses)) if g_losses else float("nan")
+            last_sep_loss = float(np.mean(sep_losses)) if sep_losses else float("nan")
+            last_proto_pull = float(np.mean(proto_pull_losses)) if proto_pull_losses else float("nan")
+            last_proto_push = float(np.mean(proto_push_losses)) if proto_push_losses else float("nan")
+            last_max_wrong_proto = float(np.mean(max_wrong_proto_sims)) if max_wrong_proto_sims else float("nan")
 
             # Periodic GAN-phase evaluation
             gan_eval_metrics = {}
@@ -878,6 +1013,14 @@ def train(
                     f"  GAN Eval @ epoch {gan_epoch + 1}: "
                     f"Loss {eval_loss:.4f} | F1 {gan_eval_metrics.get('F1', 0):.4f}"
                 )
+            if (gan_epoch + 1) % 5 == 0:
+                mid_fake_debug = debug_fake_class_predictions(generators, cd_model, num_classes, device)
+                with open(
+                    config.metrics_dir / f"{config.run_name}_gan_epoch_{gan_epoch + 1}_fake_debug.json",
+                    "w",
+                    encoding="utf-8",
+                ) as f:
+                    json.dump(mid_fake_debug, f, indent=2)
 
             should_save_gan_epoch = (
                 (config.checkpoint_interval > 0 and ((gan_epoch + 1) % config.checkpoint_interval == 0))
@@ -908,10 +1051,6 @@ def train(
                         "gan_hidden_dim": gan_hidden_dim,
                         "cd_steps": cd_steps,
                         "g_steps": g_steps,
-                        "g_steps_c2": config.g_steps_c2,
-                        "g_steps_c3": config.g_steps_c3,
-                        "g_steps_c4": config.g_steps_c4,
-                        "g_steps_c5": config.g_steps_c5,
                         "gen_batch_size": gen_batch_size,
                         "hidden_warmup_epochs": hidden_warmup_epochs,
                         "hidden_loss_weight": hidden_loss_weight,
@@ -926,8 +1065,22 @@ def train(
 
             print(
                 f"TMG GAN Epoch {gan_epoch + 1}/{gan_epochs} | "
-                f"CD_loss {last_cd_loss:.4f} | G_loss {last_g_loss:.4f}"
+                f"CD_loss {last_cd_loss:.4f} | G_loss {last_g_loss:.4f} | "
+                f"Sep_loss {last_sep_loss:.4f} | "
+                f"ProtoPull {last_proto_pull:.4f} | ProtoPush {last_proto_push:.4f} | "
+                f"MaxWrongProto {last_max_wrong_proto:.4f}"
             )
+
+            for class_id in range(num_classes):
+                class_log = per_class_proto_logs[str(class_id)]
+                if class_log["proto_pull"]:
+                    print(
+                        f"  Class {class_id} | "
+                        f"ProtoPull {np.mean(class_log['proto_pull']):.4f} | "
+                        f"ProtoPush {np.mean(class_log['proto_push']):.4f} | "
+                        f"MaxWrong {np.mean(class_log['max_wrong_proto']):.4f} | "
+                        f"LabelLoss {np.mean(class_log['label_loss']):.4f}"
+                    )
 
         phase = "clf"
         clf_start_epoch = 0
@@ -1084,10 +1237,6 @@ def train(
                         "gan_hidden_dim": gan_hidden_dim,
                         "cd_steps": cd_steps,
                         "g_steps": g_steps,
-                        "g_steps_c2": config.g_steps_c2,
-                        "g_steps_c3": config.g_steps_c3,
-                        "g_steps_c4": config.g_steps_c4,
-                        "g_steps_c5": config.g_steps_c5,
                         "gen_batch_size": gen_batch_size,
                         "hidden_warmup_epochs": hidden_warmup_epochs,
                         "hidden_loss_weight": hidden_loss_weight,
@@ -1170,10 +1319,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gan-hidden-dim", type=int, default=512)
     parser.add_argument("--cd-steps", type=int, default=5)
     parser.add_argument("--g-steps", type=int, default=1)
-    parser.add_argument("--g-steps-c2", type=int, default=2)
-    parser.add_argument("--g-steps-c3", type=int, default=3)
-    parser.add_argument("--g-steps-c4", type=int, default=4)
-    parser.add_argument("--g-steps-c5", type=int, default=4)
+    parser.add_argument("--feature-match-weight", type=float, default=2.0)
+    parser.add_argument("--prototype-pull-weight", type=float, default=4.0)
+    parser.add_argument("--prototype-push-weight", type=float, default=2.0)
+    parser.add_argument("--prototype-margin", type=float, default=0.20)
+    parser.add_argument("--prototype-refresh-interval", type=int, default=1)
     parser.add_argument("--gen-batch-size", type=int, default=1024)
     parser.add_argument("--hidden-warmup-epochs", type=int, default=1000)
     parser.add_argument("--hidden-loss-weight", type=float, default=1.0)
@@ -1270,10 +1420,11 @@ if __name__ == "__main__":
         cd_dropout=args.cd_dropout,
         embedding_dim=args.embedding_dim,
         cd_freeze_backbone_epochs=args.cd_freeze_backbone_epochs,
-        g_steps_c2=args.g_steps_c2,
-        g_steps_c3=args.g_steps_c3,
-        g_steps_c4=args.g_steps_c4,
-        g_steps_c5=args.g_steps_c5,
+        feature_match_weight=args.feature_match_weight,
+        prototype_pull_weight=args.prototype_pull_weight,
+        prototype_push_weight=args.prototype_push_weight,
+        prototype_margin=args.prototype_margin,
+        prototype_refresh_interval=args.prototype_refresh_interval,
     )
 
     train(

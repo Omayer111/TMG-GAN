@@ -57,10 +57,11 @@ class ExperimentConfig:
     cd_dropout: float = 0.15
     embedding_dim: int = 128
     cd_freeze_backbone_epochs: int = 10
-    g_steps_c2: int = 2
-    g_steps_c3: int = 3
-    g_steps_c4: int = 4
-    g_steps_c5: int = 4
+    feature_match_weight: float = 2.0
+    prototype_pull_weight: float = 4.0
+    prototype_push_weight: float = 2.0
+    prototype_margin: float = 0.20
+    prototype_refresh_interval: int = 1
 
     @property
     def checkpoint_dir(self) -> Path:
