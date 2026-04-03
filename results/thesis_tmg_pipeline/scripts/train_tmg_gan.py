@@ -796,11 +796,31 @@ def train(
             0: 1.0,
             1: 1.0,
             2: 1.5,
-            3: 4.0,
+            3: 3.5,
             4: 1.0,
             5: 1.0,
         }
         print(f"Generator classification weight by class: {generator_cls_weight_by_class}")
+
+        generator_proto_pull_by_class = {
+            0: 0.0,
+            1: 0.0,
+            2: 0.0,
+            3: 4.0,
+            4: 0.0,
+            5: 0.0,
+        }
+        print(f"Generator prototype pull weight by class: {generator_proto_pull_by_class}")
+
+        generator_proto_push_by_class = {
+            0: 0.0,
+            1: 0.0,
+            2: 0.0,
+            3: 2.0,
+            4: 0.0,
+            5: 0.0,
+        }
+        print(f"Generator prototype push weight by class: {generator_proto_push_by_class}")
 
         generator_fm_weight_by_class = {
             0: 1.0,
@@ -831,8 +851,10 @@ def train(
             print("CD backbone/embedding starts unfrozen for GAN phase.")
 
         hard_classes = [class_id for class_id in (3,) if class_id < num_classes]
-        extra_hard_g_steps = 4
+        extra_hard_g_steps = 5
         print(f"Hard-class focus: {hard_classes} | extra_hard_g_steps={extra_hard_g_steps}")
+
+        class3_to_0_ratio = None
 
         def train_generator_for_class(class_id: int) -> bool:
             class_target = torch.full((config.batch_size,), class_id, dtype=torch.long, device=device)
@@ -884,8 +906,8 @@ def train(
                     -score_fake.mean()
                     + cls_weight * label_loss
                     + hidden_loss_weight * separation_loss
-                    + config.prototype_pull_weight * proto_pull_loss
-                    + config.prototype_push_weight * proto_push_loss
+                    + generator_proto_pull_by_class.get(class_id, 0.0) * proto_pull_loss
+                    + generator_proto_push_by_class.get(class_id, 0.0) * proto_push_loss
                 )
 
             if torch.isfinite(g_loss):
@@ -1015,6 +1037,15 @@ def train(
                 )
             if (gan_epoch + 1) % 5 == 0:
                 mid_fake_debug = debug_fake_class_predictions(generators, cd_model, num_classes, device)
+                class3_hist = mid_fake_debug.get("3", {}).get("pred_hist", [])
+                class3_total = sum(class3_hist) if class3_hist else 0
+                class3_to_0 = class3_hist[0] if len(class3_hist) > 0 else 0
+                class3_to_3 = class3_hist[3] if len(class3_hist) > 3 else 0
+                class3_to_0_ratio = (class3_to_0 / class3_total) if class3_total > 0 else None
+                print(
+                    f"  Fake[3] debug: pred_as_0={class3_to_0}, pred_as_3={class3_to_3}, "
+                    f"class3_to_0_ratio={class3_to_0_ratio if class3_to_0_ratio is not None else 'None'}"
+                )
                 with open(
                     config.metrics_dir / f"{config.run_name}_gan_epoch_{gan_epoch + 1}_fake_debug.json",
                     "w",
@@ -1068,7 +1099,8 @@ def train(
                 f"CD_loss {last_cd_loss:.4f} | G_loss {last_g_loss:.4f} | "
                 f"Sep_loss {last_sep_loss:.4f} | "
                 f"ProtoPull {last_proto_pull:.4f} | ProtoPush {last_proto_push:.4f} | "
-                f"MaxWrongProto {last_max_wrong_proto:.4f}"
+                f"MaxWrongProto {last_max_wrong_proto:.4f} | "
+                f"Class3To0Ratio {class3_to_0_ratio if class3_to_0_ratio is not None else 'None'}"
             )
 
             for class_id in range(num_classes):
