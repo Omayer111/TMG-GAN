@@ -851,7 +851,7 @@ def train(
             print("CD backbone/embedding starts unfrozen for GAN phase.")
 
         hard_classes = [class_id for class_id in (3,) if class_id < num_classes]
-        extra_hard_g_steps = 4
+        extra_hard_g_steps = 5
         print(f"Hard-class focus: {hard_classes} | extra_hard_g_steps={extra_hard_g_steps}")
 
         class3_to_0_ratio = None
@@ -868,11 +868,6 @@ def train(
 
                 fake_batch = generators[class_id].sample(config.batch_size, device=device)
                 score_fake, pred_fake, hidden_fake_k = cd_model(fake_batch)
-                confusion_margin_loss = torch.zeros((), device=device, dtype=score_fake.dtype)
-                if class_id == 3 and num_classes > 5:
-                    target_logit = pred_fake[:, 3]
-                    confuser_logit = pred_fake[:, 5]  # class 5 is the observed confuser for class 3
-                    confusion_margin_loss = F.relu(confuser_logit - target_logit + 0.5).mean()
 
                 label_loss = ce(pred_fake, class_target)
                 cls_weight = generator_cls_weight_by_class.get(class_id, 1.0)
@@ -913,7 +908,6 @@ def train(
                     + hidden_loss_weight * separation_loss
                     + generator_proto_pull_by_class.get(class_id, 0.0) * proto_pull_loss
                     + generator_proto_push_by_class.get(class_id, 0.0) * proto_push_loss
-                    + 3.0 * confusion_margin_loss
                 )
 
             if torch.isfinite(g_loss):
@@ -931,7 +925,6 @@ def train(
                 per_class_proto_logs[str(class_id)]["proto_push"].append(float(proto_push_loss.item()))
                 per_class_proto_logs[str(class_id)]["max_wrong_proto"].append(float(max_wrong_proto_sim.item()))
                 per_class_proto_logs[str(class_id)]["label_loss"].append(float(label_loss.item()))
-                per_class_proto_logs[str(class_id)]["conf_margin"].append(float(confusion_margin_loss.item()))
                 return True
 
             g_optimizers[class_id].zero_grad(set_to_none=True)
@@ -969,7 +962,6 @@ def train(
                     "proto_push": [],
                     "max_wrong_proto": [],
                     "label_loss": [],
-                    "conf_margin": [],
                 }
                 for class_id in range(num_classes)
             }
@@ -1119,8 +1111,7 @@ def train(
                         f"ProtoPull {np.mean(class_log['proto_pull']):.4f} | "
                         f"ProtoPush {np.mean(class_log['proto_push']):.4f} | "
                         f"MaxWrong {np.mean(class_log['max_wrong_proto']):.4f} | "
-                        f"LabelLoss {np.mean(class_log['label_loss']):.4f} | "
-                        f"ConfMargin {np.mean(class_log['conf_margin']):.4f}"
+                        f"LabelLoss {np.mean(class_log['label_loss']):.4f}"
                     )
 
         phase = "clf"
